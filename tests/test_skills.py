@@ -3,7 +3,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-SCRIPTS = Path(__file__).parents[1] / "src" / "dcc_mcp_aftereffects" / "skills" / "aftereffects-project" / "scripts"
+SCRIPTS = (
+    Path(__file__).parents[1]
+    / "src"
+    / "dcc_mcp_aftereffects"
+    / "skills"
+    / "aftereffects-project"
+    / "scripts"
+)
 
 
 def load_script(name):
@@ -19,8 +26,19 @@ def test_project_skills_use_typed_aftereffects_facade(tmp_path):
     app = SimpleNamespace(project=project, active_item=comp)
     cases = (
         ("inspect_project", (), {"project_name": "Demo", "item_count": 1, "active_item": "Intro"}),
-        ("list_compositions", (), {"compositions": [{"name": "Intro", "width": 1920, "height": 1080, "duration": 5.0}], "composition_count": 1}),
-        ("save_project", (str(tmp_path / "intro.aep"),), {"path": str(tmp_path / "intro.aep"), "saved": True}),
+        (
+            "list_compositions",
+            (),
+            {
+                "compositions": [{"name": "Intro", "width": 1920, "height": 1080, "duration": 5.0}],
+                "composition_count": 1,
+            },
+        ),
+        (
+            "save_project",
+            (str(tmp_path / "intro.aep"),),
+            {"path": str(tmp_path / "intro.aep"), "saved": True},
+        ),
     )
     for name, args, expected in cases:
         module = load_script(name)
@@ -34,7 +52,9 @@ def test_motion_intro_uses_typed_template_workflow(tmp_path):
     music = tmp_path / "music.mp3"
     template.write_bytes(b"aep")
     music.write_bytes(b"mp3")
-    title = SimpleNamespace(source_text=object(), set_source_text=mock.Mock(), set_keyframes=mock.Mock())
+    title = SimpleNamespace(
+        source_text=object(), set_source_text=mock.Mock(), set_keyframes=mock.Mock()
+    )
     subtitle = SimpleNamespace(source_text=object(), set_source_text=mock.Mock())
     output_module = SimpleNamespace(set_output_path=mock.Mock())
     render_item = SimpleNamespace(output_module=mock.Mock(return_value=output_module))
