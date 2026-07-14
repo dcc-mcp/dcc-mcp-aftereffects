@@ -1,14 +1,25 @@
-from dcc_mcp_core.skill import skill_entry, skill_success
+from adobe.after_effects import AfterEffects
+from adobe.core.errors import HostScriptError
+from adobe.dcc_mcp import action_result
+from dcc_mcp_core.skill import skill_entry
 
-from dcc_mcp_aftereffects.bridge import call_bridge
+
+def inspect_project():
+    app = AfterEffects()
+    project = app.project
+    if project is None:
+        raise HostScriptError("After Effects has no active project")
+    active = app.active_item
+    return {
+        "project_name": project.name,
+        "item_count": project.item_count,
+        "active_item": active.name if active else None,
+    }
 
 
 @skill_entry
 def main(**_kwargs):
-    return skill_success(
-        "After Effects project inspected.",
-        **call_bridge("DCC_MCP_AFTEREFFECTS", "inspect_project", {}),
-    )
+    return action_result("After Effects project inspected.", inspect_project)
 
 
 if __name__ == "__main__":

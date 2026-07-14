@@ -6,11 +6,11 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from adobe.runtime import BrokerHandle, ensure_broker
 from dcc_mcp_core import DccServerOptions
 from dcc_mcp_core.server_base import DccServerBase
 
 from .__version__ import __version__
-from .bridge import BridgeBroker
 
 DEFAULT_PORT = 8765
 _server: Optional["AfterEffectsMcpServer"] = None
@@ -20,7 +20,7 @@ class AfterEffectsMcpServer(DccServerBase):
     """MCP server whose typed calls are completed by the CEP panel."""
 
     def __init__(self, port: int = DEFAULT_PORT) -> None:
-        self.bridge = BridgeBroker("DCC_MCP_AFTEREFFECTS", 47394)
+        self.broker: Optional[BrokerHandle] = None
         options = DccServerOptions.from_env(
             "aftereffects",
             Path(__file__).resolve().parent / "skills",
@@ -31,12 +31,21 @@ class AfterEffectsMcpServer(DccServerBase):
         super().__init__(options=options)
 
     def start(self, **kwargs):
-        self.bridge.start()
-        return super().start(**kwargs)
+        self.broker = ensure_broker()
+        try:
+            return super().start(**kwargs)
+        except Exception:
+            self.broker.stop()
+            self.broker = None
+            raise
 
     def stop(self) -> None:
-        super().stop()
-        self.bridge.stop()
+        try:
+            super().stop()
+        finally:
+            if self.broker is not None:
+                self.broker.stop()
+                self.broker = None
 
 
 def start_server(port: Optional[int] = None) -> AfterEffectsMcpServer:
