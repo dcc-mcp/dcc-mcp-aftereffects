@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.2.0...v0.3.0) (2026-07-14)
+
+
+### Features
+
+* use shared adobepy runtime ([#2](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/2)) ([0d23c9e](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/0d23c9eabf935fd1cee953ebce11688e0a3e902b))
+
 ## [0.2.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.1.0...v0.2.0) (2026-07-14)
 
 
