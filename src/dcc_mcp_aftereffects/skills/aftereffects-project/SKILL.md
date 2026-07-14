@@ -9,10 +9,10 @@ allowed-tools: Python
 metadata:
   dcc-mcp:
     dcc: aftereffects
-    version: "0.1.0"
+    version: "0.2.0"
     layer: domain
     stage: scene
-    search-hint: "after effects project composition inspect save render aep motion intro template"
+    search-hint: "after effects project composition inspect save render aep motion intro template stock video music"
     tags: "adobe, aftereffects, compositing, animation"
     tools: tools.yaml
 ---
