@@ -33,7 +33,7 @@ tools:
     timeout_hint_secs: 60
     source_file: scripts/save_project.py
   - name: create_motion_intro
-    description: Open an AE template, apply title text and optional audio, save a project copy, and render it.
+    description: Open an AE template, apply title text, background footage, and optional audio, save a project copy, and render it.
     input_schema:
       type: object
       required: [template_path, project_path, output_path]
@@ -43,6 +43,11 @@ tools:
         output_path: {type: string, description: Absolute rendered media path.}
         title: {type: string, default: DCC-MCP}
         subtitle: {type: string, default: One protocol. Every creative app.}
+        footage_paths:
+          type: array
+          description: Absolute stock-video paths imported and moved behind the title layers.
+          items: {type: string}
+          default: []
         audio_paths:
           type: array
           items: {type: string}

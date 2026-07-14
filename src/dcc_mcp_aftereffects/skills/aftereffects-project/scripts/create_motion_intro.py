@@ -23,11 +23,13 @@ def create_motion_intro(
     output_path,
     title="DCC-MCP",
     subtitle="One protocol. Every creative app.",
+    footage_paths=None,
     audio_paths=None,
 ):
     template_path = _absolute_path(template_path, ".aep", must_exist=True)
     project_path = _absolute_path(project_path, ".aep")
     output_path = _absolute_path(output_path)
+    footage_paths = [_absolute_path(path, must_exist=True) for path in footage_paths or []]
     audio_paths = [_absolute_path(path, must_exist=True) for path in audio_paths or []]
 
     app = AfterEffects()
@@ -50,6 +52,10 @@ def create_motion_intro(
         [{"time": 0, "value": [0, 0]}, {"time": 0.8, "value": [100, 100]}],
     )
 
+    for path in footage_paths:
+        footage_layer = composition.add_footage_layer(project.import_file(path))
+        footage_layer.move_to_end()
+
     for path in audio_paths:
         composition.add_footage_layer(project.import_file(path))
 
@@ -62,6 +68,7 @@ def create_motion_intro(
         "project_path": project_path,
         "output_path": output_path,
         "composition": composition.name,
+        "footage_count": len(footage_paths),
         "audio_count": len(audio_paths),
         "rendered": True,
     }

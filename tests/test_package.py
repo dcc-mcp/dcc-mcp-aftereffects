@@ -13,5 +13,5 @@ def test_version_metadata_is_synchronized():
 
 def test_adapter_uses_shared_adobepy_runtime():
     root = Path(__file__).parents[1]
-    assert '"adobepy>=0.4.0,<1.0.0"' in (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"adobepy>=0.5.0,<1.0.0"' in (root / "pyproject.toml").read_text(encoding="utf-8")
     assert not (root / "src" / "dcc_mcp_aftereffects" / "bridge.py").exists()
