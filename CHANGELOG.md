@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.4.0...v0.4.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* verify rendered intro output ([#6](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/6)) ([fcc4ad8](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/fcc4ad8cbd0561375269544656b0cacb05844f34))
+
 ## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.3.0...v0.4.0) (2026-07-14)
 
 
