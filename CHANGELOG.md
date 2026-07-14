@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.3.0...v0.4.0) (2026-07-14)
+
+
+### Features
+
+* add stock footage to motion intros ([#4](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/4)) ([37e70aa](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/37e70aa43c26dcdbdfa6d4c5f242eb835229ec03))
+
 ## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.2.0...v0.3.0) (2026-07-14)
 
 
