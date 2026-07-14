@@ -63,6 +63,9 @@ def create_motion_intro(
     render_item = composition.add_to_render_queue(output_path=output_path)
     render_item.output_module(1).set_output_path(output_path)
     project.render_queue.render()
+    rendered_output = Path(output_path)
+    if not rendered_output.is_file() or rendered_output.stat().st_size == 0:
+        raise HostScriptError(f"After Effects render produced no output: {output_path}")
     return {
         "template_path": template_path,
         "project_path": project_path,
@@ -70,6 +73,7 @@ def create_motion_intro(
         "composition": composition.name,
         "footage_count": len(footage_paths),
         "audio_count": len(audio_paths),
+        "output_size_bytes": rendered_output.stat().st_size,
         "rendered": True,
     }
 

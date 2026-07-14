@@ -3,6 +3,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 SCRIPTS = (
     Path(__file__).parents[1]
     / "src"
@@ -67,7 +69,11 @@ def test_motion_intro_uses_typed_template_workflow(tmp_path):
         add_footage_layer=mock.Mock(side_effect=[background_layer, SimpleNamespace()]),
         add_to_render_queue=mock.Mock(return_value=render_item),
     )
-    render_queue = SimpleNamespace(render=mock.Mock())
+    project_path = tmp_path / "result.aep"
+    output_path = tmp_path / "result.mov"
+    render_queue = SimpleNamespace(
+        render=mock.Mock(side_effect=lambda: output_path.write_bytes(b"mov"))
+    )
     project = SimpleNamespace(
         compositions=[composition],
         import_file=mock.Mock(return_value=SimpleNamespace()),
@@ -76,8 +82,6 @@ def test_motion_intro_uses_typed_template_workflow(tmp_path):
     )
     app = SimpleNamespace(open_project=mock.Mock(return_value=project))
     module = load_script("create_motion_intro")
-    project_path = tmp_path / "result.aep"
-    output_path = tmp_path / "result.mov"
     with mock.patch.object(module, "AfterEffects", return_value=app):
         result = module.create_motion_intro(
             str(template),
@@ -92,7 +96,14 @@ def test_motion_intro_uses_typed_template_workflow(tmp_path):
     title.set_keyframes.assert_called_once()
     assert result["footage_count"] == 1
     assert result["audio_count"] == 1
+    assert result["output_size_bytes"] == 3
     assert project.import_file.call_args_list == [mock.call(str(footage)), mock.call(str(music))]
     background_layer.move_to_end.assert_called_once_with()
     project.save.assert_called_once_with(str(project_path))
     render_queue.render.assert_called_once()
+
+    output_path.unlink()
+    render_queue.render.side_effect = None
+    with mock.patch.object(module, "AfterEffects", return_value=app):
+        with pytest.raises(module.HostScriptError, match="render produced no output"):
+            module.create_motion_intro(str(template), str(project_path), str(output_path))
