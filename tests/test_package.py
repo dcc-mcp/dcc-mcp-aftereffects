@@ -11,7 +11,7 @@ def test_version_metadata_is_synchronized():
     assert manifest["."] == __version__
 
 
-def test_cep_panel_is_packaged_with_source():
-    panel = Path(__file__).parents[1] / "src" / "dcc_mcp_aftereffects" / "aftereffects_cep"
-    assert (panel / "CSXS" / "manifest.xml").is_file()
-    assert (panel / "jsx" / "host.jsx").is_file()
+def test_adapter_uses_shared_adobepy_runtime():
+    root = Path(__file__).parents[1]
+    assert '"adobepy>=0.4.0,<1.0.0"' in (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert not (root / "src" / "dcc_mcp_aftereffects" / "bridge.py").exists()

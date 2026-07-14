@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.dccmcp.aftereffects" ExtensionBundleVersion="0.1.0" ExtensionBundleName="DCC MCP After Effects">
-  <ExtensionList><Extension Id="com.dccmcp.aftereffects.panel" Version="0.1.0" /></ExtensionList>
-  <ExecutionEnvironment><HostList><Host Name="AEFT" Version="[16.0,99.9]" /></HostList><LocaleList><Locale Code="All" /></LocaleList><RequiredRuntimeList><RequiredRuntime Name="CSXS" Version="10.0" /></RequiredRuntimeList></ExecutionEnvironment>
-  <DispatchInfoList><Extension Id="com.dccmcp.aftereffects.panel"><DispatchInfo><Resources><MainPath>index.html</MainPath><ScriptPath>jsx/host.jsx</ScriptPath></Resources><Lifecycle><AutoVisible>true</AutoVisible></Lifecycle><UI><Type>Panel</Type><Menu>DCC MCP</Menu><Geometry><Size><Width>280</Width><Height>80</Height></Size></Geometry></UI></DispatchInfo></Extension></DispatchInfoList>
-</ExtensionManifest>
