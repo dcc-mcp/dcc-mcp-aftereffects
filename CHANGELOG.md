@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.4.1...v0.5.0) (2026-07-16)
+
+
+### Features
+
+* default adapter instances to dynamic ports ([#8](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/8)) ([baf847e](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/baf847e8c296787aba8d126799cff5b9d67dccae))
+
 ## [0.4.1](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.4.0...v0.4.1) (2026-07-14)
 
 
