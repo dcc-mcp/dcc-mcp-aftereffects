@@ -59,3 +59,66 @@ tools:
     affinity: any
     timeout_hint_secs: 600
     source_file: scripts/create_motion_intro.py
+  - name: open_project
+    description: Open an existing After Effects .aep project from an absolute path.
+    input_schema:
+      type: object
+      required: [path]
+      properties: {path: {type: string, description: Absolute existing .aep path.}}
+    read_only: false
+    destructive: true
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 60
+    source_file: scripts/open_project.py
+  - name: list_project_items
+    description: List or find project items, compositions, footage, folders, and selected items.
+    input_schema:
+      type: object
+      properties:
+        kind: {type: string, enum: [all, composition, footage, folder, selected], default: all}
+        item_id: {description: Optional item identifier.}
+        name: {type: string, description: Optional exact item name.}
+    read_only: true
+    destructive: false
+    idempotent: true
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 30
+    source_file: scripts/list_project_items.py
+  - name: import_file
+    description: Import footage or an image sequence into the active After Effects project.
+    input_schema:
+      type: object
+      required: [path]
+      properties:
+        path: {type: string, description: Absolute existing input path.}
+        sequence: {type: boolean, default: false}
+        force_alphabetical: {type: boolean, default: false}
+    read_only: false
+    destructive: false
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 60
+    source_file: scripts/import_file.py
+  - name: create_composition
+    description: Create a composition with explicit dimensions, duration, and frame rate.
+    input_schema:
+      type: object
+      required: [name, width, height, duration, frame_rate]
+      properties:
+        name: {type: string}
+        width: {type: integer, minimum: 1}
+        height: {type: integer, minimum: 1}
+        duration: {type: number, exclusiveMinimum: 0}
+        frame_rate: {type: number, exclusiveMinimum: 0}
+        pixel_aspect: {type: number, exclusiveMinimum: 0, default: 1.0}
+    read_only: false
+    destructive: false
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 30
+    source_file: scripts/create_composition.py
