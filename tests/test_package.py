@@ -13,7 +13,7 @@ def test_version_metadata_is_synchronized():
 
 def test_adapter_uses_shared_adobepy_runtime():
     root = Path(__file__).parents[1]
-    assert '"adobepy>=0.5.0,<1.0.0"' in (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"adobepy>=0.6.1,<1.0.0"' in (root / "pyproject.toml").read_text(encoding="utf-8")
     assert not (root / "src" / "dcc_mcp_aftereffects" / "bridge.py").exists()
 
 
@@ -26,6 +26,7 @@ def test_start_server_defers_port_resolution_to_core(monkeypatch):
     stub = SimpleNamespace(
         is_running=False,
         register_builtin_actions=lambda: None,
+        run_registration=lambda **_kwargs: None,
         start=lambda: None,
         stop=lambda: None,
     )
@@ -34,7 +35,7 @@ def test_start_server_defers_port_resolution_to_core(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "AfterEffectsMcpServer",
-        lambda port=None: ports.append(port) or stub,
+        lambda port=None, **_kwargs: ports.append(port) or stub,
     )
     monkeypatch.setenv("DCC_MCP_AFTEREFFECTS_PORT", "8765")
 

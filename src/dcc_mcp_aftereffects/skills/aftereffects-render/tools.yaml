@@ -1,0 +1,82 @@
+tools:
+  - name: inspect_render_queue
+    description: Inspect render queue state and all queued items.
+    input_schema: {type: object, properties: {}}
+    read_only: true
+    destructive: false
+    idempotent: true
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 30
+    source_file: scripts/inspect_render_queue.py
+  - name: queue_composition
+    description: Add a composition to the render queue with optional templates and output path.
+    input_schema:
+      type: object
+      required: [composition]
+      properties:
+        composition: {description: Composition id, index, or exact name.}
+        render_settings_template: {type: string}
+        output_module_template: {type: string}
+        output_path: {type: string, description: Absolute output path.}
+        settings: {type: object}
+    read_only: false
+    destructive: false
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 60
+    source_file: scripts/queue_composition.py
+  - name: control_render_queue
+    description: Render, pause, stop, show, notify, or send the queue to Adobe Media Encoder.
+    input_schema:
+      type: object
+      required: [operation]
+      properties:
+        operation: {type: string, enum: [render, pause, stop, show, queue_in_ame, notify]}
+        enabled: {type: boolean, default: true}
+        queue_in_ame_start: {type: boolean, default: false}
+    read_only: false
+    destructive: true
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 600
+    source_file: scripts/control_render_queue.py
+  - name: configure_render_queue_item
+    description: Apply a template, settings, render flag, or notification flag to a queue item.
+    input_schema:
+      type: object
+      required: [index]
+      properties:
+        index: {type: integer, minimum: 1}
+        template: {type: string}
+        settings: {type: object}
+        render: {type: boolean}
+        notify: {type: boolean}
+    read_only: false
+    destructive: true
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 60
+    source_file: scripts/configure_render_queue_item.py
+  - name: configure_output_module
+    description: Configure one output module, output path, or save its settings as a template.
+    input_schema:
+      type: object
+      required: [item_index]
+      properties:
+        item_index: {type: integer, minimum: 1}
+        module_index: {type: integer, minimum: 1, default: 1}
+        template: {type: string}
+        settings: {type: object}
+        output_path: {type: string, description: Absolute output path.}
+        save_template: {type: string}
+    read_only: false
+    destructive: true
+    idempotent: false
+    execution: sync
+    affinity: any
+    timeout_hint_secs: 60
+    source_file: scripts/configure_output_module.py

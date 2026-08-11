@@ -53,12 +53,29 @@ MCP adapter for Adobe After Effects, built on the shared `adobepy` broker, CEP b
 pip install dcc-mcp-aftereffects
 ```
 
-Install the shared bridge with `adobepy install-bridge after-effects --dest <extension-dir> --token <token>`, open it in After Effects, then start the adapter. Each adapter instance uses an OS-assigned port and registers it for CLI discovery. Connect through the stable gateway at `http://127.0.0.1:9765/mcp`; set `DCC_MCP_AFTEREFFECTS_PORT` only when a fixed direct endpoint is required.
+Install the shared bridge with `adobepy install-bridge after-effects --dest <extension-dir> --token <token>`, open it in After Effects, then start the adapter with `dcc-mcp-aftereffects`. Each adapter instance uses an OS-assigned port and registers it for CLI discovery. Connect through the stable gateway at `http://127.0.0.1:9765/mcp`; set `DCC_MCP_AFTEREFFECTS_PORT` only when a fixed direct endpoint is required.
 
 Set `ADOBEPY_TOKEN` to the same non-default token used when installing the bridge.
 
-## Tools
+The adapter reports ready only after the target After Effects bridge advertises
+the complete typed/official-DOM contract and a real host version RPC succeeds.
+A broker process is stopped only when it was started by this adapter.
 
-- `aftereffects-project.inspect_project`
-- `aftereffects-project.list_compositions`
-- `aftereffects-project.save_project`
+## Skill groups
+
+- `aftereffects-project`: inspect/open/save projects, list and import project
+  items, create compositions, and run the motion-intro workflow.
+- `aftereffects-layers`: inspect compositions, layers, effects, masks, and text;
+  create text/solid/footage layers; edit text, transforms, keyframes, and order.
+- `aftereffects-render`: inspect and control the render queue, queue
+  compositions, and configure render settings and output modules.
+- `aftereffects-advanced`: structured access to the complete official object
+  model. Raw ExtendScript is an explicit destructive fallback, not the primary
+  API.
+
+Load a group before first use when progressive loading is enabled:
+
+```bash
+dcc-mcp-cli load-skill aftereffects-layers --dcc-type aftereffects
+dcc-mcp-cli search --query "create text layer" --dcc-type aftereffects
+```
