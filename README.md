@@ -53,7 +53,21 @@ MCP adapter for Adobe After Effects, built on the shared `adobepy` broker, CEP b
 pip install dcc-mcp-aftereffects
 ```
 
-Install the shared bridge with `adobepy install-bridge after-effects --dest <extension-dir> --token <token>`, open it in After Effects, then start the adapter with `dcc-mcp-aftereffects`. Each adapter instance uses an OS-assigned port and registers it for CLI discovery. Connect through the stable gateway at `http://127.0.0.1:9765/mcp`; set `DCC_MCP_AFTEREFFECTS_PORT` only when a fixed direct endpoint is required.
+Use the standard adapter-owned lifecycle; it stages the official adobepy CEP
+bridge without putting `ADOBEPY_TOKEN` in process arguments:
+
+```bash
+dcc-mcp-aftereffects install --json --dry-run --dcc-path "<host>" --python "<python>"
+dcc-mcp-aftereffects install --json --yes --dcc-path "<host>" --python "<python>"
+dcc-mcp-aftereffects verify --json --dcc-path "<host>" --python "<python>"
+```
+
+See [install.md](install.md) for supported Windows/macOS paths, the Linux
+boundary, adobepy CLI provisioning, receipt-driven upgrade/uninstall, stable
+exit codes, and troubleshooting. Each adapter instance uses an OS-assigned
+port and registers it for CLI discovery. Connect through the stable gateway at
+`http://127.0.0.1:9765/mcp`; set `DCC_MCP_AFTEREFFECTS_PORT` only when a fixed
+direct endpoint is required.
 
 Set `ADOBEPY_TOKEN` to the same non-default token used when installing the bridge.
 
