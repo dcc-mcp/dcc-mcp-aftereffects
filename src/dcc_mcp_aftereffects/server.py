@@ -16,6 +16,8 @@ from .__version__ import __version__
 from .capabilities import aftereffects_capabilities
 from .config import AfterEffectsConfig
 from .context import collect_context
+from .install_discovery import default_state_dir
+from .install_io import capture_bootstrap_errors
 from .runtime import AfterEffectsStatus, probe_aftereffects
 
 logger = logging.getLogger(__name__)
@@ -141,7 +143,12 @@ class AfterEffectsMcpServer(DccServerBase):
             timeout=self.adapter_config.timeout,
         )
         try:
-            self._sample_bridge()
+            with capture_bootstrap_errors(
+                default_state_dir() / "bootstrap-errors.json",
+                "startup",
+                self.adapter_config.token,
+            ):
+                self._sample_bridge()
             handle = super().start(install_atexit_hook=install_atexit_hook)
             self._start_watchdog()
             return handle

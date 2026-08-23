@@ -1,5 +1,6 @@
 from unittest import mock
 
+import pytest
 from adobe.runtime import BrokerHandle
 
 from dcc_mcp_aftereffects.config import AfterEffectsConfig
@@ -52,3 +53,30 @@ def test_unready_host_keeps_dcc_readiness_red():
 
     assert status.ready is False
     assert server._readiness.probe.report()["dcc"] is False
+
+
+def test_startup_captures_bootstrap_errors_without_leaking_the_token(monkeypatch, tmp_path):
+    secret = "bootstrap-token-must-be-redacted"
+    monkeypatch.setenv("DCC_MCP_AFTEREFFECTS_STATE_DIR", str(tmp_path / "state"))
+    broker = BrokerHandle("http://127.0.0.1:47391", secret)
+    broker.stop = mock.Mock()
+
+    def fail_readiness(**_kwargs):
+        raise RuntimeError(f"bridge rejected {secret}")
+
+    server = AfterEffectsMcpServer(
+        gateway_port=0,
+        config=AfterEffectsConfig(token=secret),
+        broker_factory=mock.Mock(return_value=broker),
+        readiness_probe=fail_readiness,
+    )
+
+    with pytest.raises(RuntimeError, match="bridge rejected"):
+        server.start(install_atexit_hook=False)
+
+    diagnostics = tmp_path / "state" / "bootstrap-errors.json"
+    text = diagnostics.read_text(encoding="utf-8")
+    assert secret not in text
+    assert "<redacted>" in text
+    assert "startup" in text
+    broker.stop.assert_called_once_with()

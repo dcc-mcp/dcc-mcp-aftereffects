@@ -27,3 +27,27 @@ def test_project_registers_a_console_entry_point():
     pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
 
     assert 'dcc-mcp-aftereffects = "dcc_mcp_aftereffects.cli:main"' in pyproject
+
+
+def test_cli_exposes_standard_install_lifecycle_flags():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        [
+            "install",
+            "--json",
+            "--yes",
+            "--dry-run",
+            "--dcc-path",
+            "C:/Program Files/Adobe/After Effects/AfterFX.exe",
+            "--python",
+            "C:/Python312/python.exe",
+        ]
+    )
+
+    assert args.command == "install"
+    assert args.json is True
+    assert args.yes is True
+    assert args.dry_run is True
+    assert args.dcc_path.endswith("AfterFX.exe")
+    assert args.python.endswith("python.exe")

@@ -1,0 +1,173 @@
+# Install dcc-mcp-aftereffects
+
+This runbook installs, verifies, upgrades, and removes the DCC-MCP adapter for
+Adobe After Effects. Agents should read the
+[raw file](https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-aftereffects/main/install.md)
+before changing an installation.
+
+The Core catalog `instructions_url` and pinned install block are tracked outside
+this repository. Until that catalog change lands, use this adapter-owned entry
+point and do not claim catalog installation is complete.
+
+## Requirements
+
+- **After Effects:** 2024 / 24.0 or newer on Windows or macOS.
+- **Python:** 3.9 or newer for the adapter sidecar; this is not After Effects'
+  embedded ExtendScript runtime.
+- **dcc-mcp-core:** 0.19.91 or newer in the selected Python environment.
+- **adobepy:** Python SDK 0.6.1 or newer plus a supported `adobepy` CLI binary.
+- **Authentication:** one non-empty `ADOBEPY_TOKEN` shared by the broker and
+  CEP bridge.
+- **Permissions:** write access to the current user's CEP extension and
+  DCC-MCP state directories.
+
+The PyPI `adobepy` wheel contains the Python SDK, not the Rust CLI. On Windows,
+use a verified official adobepy release bundle and set `ADOBEPY_CLI` to its
+`adobepy.exe`. On macOS, use a supported CLI built from the exact approved
+adobepy release tag. When no supported CLI is available, install and upgrade
+fail closed with exit `20`; the adapter does not copy an unverified bridge.
+
+Keep the token in the process environment. The adapter passes it to the
+supported CLI through `ADOBEPY_TOKEN`; it never places the token in command
+arguments, reports, logs, receipts, or PR text.
+
+## Supported versions
+
+| Adapter | dcc-mcp-core | After Effects | Python | Platform |
+|---|---|---|---|---|
+| 0.6.x | >=0.19.91,<1 | >=24.0 | >=3.9 | Windows 10/11 x64 |
+| 0.6.x | >=0.19.91,<1 | >=24.0 | >=3.9 | macOS with a supported adobepy CLI |
+| 0.6.x | >=0.19.91,<1 | unavailable | >=3.9 | Linux package development only; no host install |
+
+Default host and profile paths are:
+
+- Windows host: `C:\Program Files\Adobe\Adobe After Effects 2024\Support Files\AfterFX.exe`
+- Windows CEP root: `%APPDATA%\Adobe\CEP\extensions`
+- macOS host: `/Applications/Adobe After Effects 2024/Adobe After Effects 2024.app`
+- macOS CEP root: `~/Library/Application Support/Adobe/CEP/extensions`
+
+The adapter owns only the `dcc-mcp-aftereffects` child under that CEP root and
+its receipt. Unsupported hosts, interpreters, and profiles fail preflight
+before any directory is changed.
+
+## Agent quick path
+
+Set the secret and supported CLI in the operator environment without printing
+the secret. Then inspect the non-mutating plan:
+
+```text
+dcc-mcp-aftereffects install --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json --dry-run
+```
+
+Review the host, interpreter, extension path, receipt path, current state
+(`fresh`, `installed`, or `partial`), ordered steps, and every `next_steps`
+entry. Execute only after the plan is correct:
+
+```text
+dcc-mcp-aftereffects install --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json --yes
+dcc-mcp-aftereffects status --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json
+dcc-mcp-aftereffects verify --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json
+```
+
+All lifecycle verbs accept the uniform flags `--json`, `--yes`, `--dry-run`,
+`--dcc-path`, and `--python`. Stable exits are:
+
+| Exit | Meaning |
+|---:|---|
+| 0 | plan or operation completed successfully |
+| 10 | host, profile, interpreter, version, authentication, or receipt preflight failed |
+| 20 | a supported external adobepy CLI is unavailable |
+| 30 | staged install, receipt commit, rollback, or uninstall failed |
+| 40 | import or typed verify-to-usable probe failed |
+| 50 | After Effects must release/reload a locked or newly installed CEP extension |
+
+## Manual path
+
+1. Install the adapter wheel in the Python environment that will run the
+   sidecar: `python -m pip install --upgrade dcc-mcp-aftereffects`.
+2. Obtain the official adobepy CLI for the intended platform from an approved,
+   versioned release and verify its published checksum. Do not scrape a
+   mutable “latest” page.
+3. Set `ADOBEPY_CLI` to that executable, `ADOBEPY_TOKEN` to the broker token,
+   and optionally `ADOBEPY_BROKER_URL` / `ADOBEPY_TARGET`.
+4. Run the JSON dry-run from **Agent quick path** with the exact host and
+   Python paths.
+5. Execute with `--yes`. The adapter asks the official adobepy CLI to assemble
+   the CEP extension in a sibling staging directory, validates its typed JSON
+   result, atomically swaps the adapter-owned directory, and writes a receipt.
+6. If exit `50` returns one `next_steps[].command`, save work and run that
+   command to start or reload After Effects. The installer never drives the UI
+   and never kills the user's host process.
+7. If Adobe physically requires enabling a development CEP extension, use the
+   applicable Adobe CEP development workflow once, then rerun `verify`. This is
+   not replaced with UI automation or a broad scripting fallback.
+8. Run the verification sequence below.
+
+An existing target without a matching receipt is `partial`; `install` plans a
+repair. Upgrade keeps the old directory until the new staged payload and
+receipt are ready. A commit failure restores the prior directory. No
+delete-then-copy update is used.
+
+## Verify
+
+```text
+dcc-mcp-aftereffects verify --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json
+dcc-mcp-cli wait-ready --dcc-type aftereffects --require host_execution_bridge --require main_thread_executor
+dcc-mcp-cli search --query "After Effects project ping" --dcc-type aftereffects
+```
+
+Verification validates the receipt and file digests, imports `adobe` and
+`dcc_mcp_aftereffects` in the selected interpreter, requires the complete CEP
+capability contract, and performs the typed After Effects version RPC. Only
+then is `verify.directly_usable` true. A broker socket alone is not readiness.
+
+Bootstrap/startup failures are captured as a bounded, redacted JSON diagnostic
+under the adapter state directory. It records stage, error type, timestamp, and
+message but never the token.
+
+## Upgrade
+
+Upgrade the Python wheel first, inspect the host change, then execute:
+
+```text
+python -m pip install --upgrade dcc-mcp-aftereffects
+dcc-mcp-aftereffects upgrade --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json --dry-run
+dcc-mcp-aftereffects upgrade --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json --yes
+dcc-mcp-aftereffects verify --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json
+```
+
+Upgrade requires the existing adapter receipt. It stages before swapping and
+restores the previous extension if bridge installation or receipt commit
+fails. Exit `50` means After Effects owns a file lock or must reload the newly
+installed extension; follow only the returned command.
+
+## Uninstall
+
+Inspect the receipt-driven plan, then remove only the adapter-owned extension:
+
+```text
+dcc-mcp-aftereffects uninstall --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json --dry-run
+dcc-mcp-aftereffects uninstall --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json --yes
+python -m pip uninstall dcc-mcp-aftereffects
+```
+
+Uninstall consumes the receipt and refuses to delete an unreceipted or
+mismatched directory. After Effects projects, Adobe preferences, other CEP
+extensions, the broker, and adobepy remain operator-owned.
+
+## Troubleshooting
+
+| Result | Diagnosis | Action |
+|---|---|---|
+| Exit 10, `host` | host not found or wrong `--dcc-path` | Pass the exact `AfterFX.exe` or `.app` from the table. |
+| Exit 10, `python` / `core` | wrong sidecar interpreter or old Core | Install the wheel/Core in that interpreter and pass it with `--python`. |
+| Exit 10, `authentication` | `ADOBEPY_TOKEN` is missing | Set it in the installer/broker environment without echoing it. |
+| Exit 10, `receipt` | partial or mismatched install | Run `status`, inspect paths, then use `install` to repair; do not delete user files. |
+| Exit 20, `acquire` | supported adobepy CLI not found | Provision a checksum-verified official CLI and set `ADOBEPY_CLI`. |
+| Exit 30, `install` / `rollback` | staging, commit, or rollback failed | Preserve the redacted report and retry only after fixing permissions/disk space. |
+| Exit 40, `import` | target environment cannot import both packages | Repair that exact Python environment. |
+| Exit 40, `readiness` | CEP bridge is not loaded or typed RPC failed | Start the intended project, follow Adobe's CEP development workflow if required, and rerun verify. |
+| Exit 50 | host reload or real file lock | Save work, close/restart only the reported After Effects instance, then repeat. |
+
+For shared runtime diagnosis, keep the redacted failure report and run
+`dcc-mcp-cli doctor` and `dcc-mcp-cli list`.
