@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -130,8 +131,9 @@ def _signature_helper(
     platform: str, environ: Mapping[str, str]
 ) -> tuple[Path, dict[str, Any]] | None:
     if platform == "win32":
-        system_root = environ.get("SystemRoot") or environ.get("SYSTEMROOT")
-        if not system_root:
+        del environ
+        system_root = _windows_directory()
+        if system_root is None:
             return None
         helper = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     elif platform == "darwin":
@@ -139,7 +141,94 @@ def _signature_helper(
     else:
         return None
     identity = _stable_file_identity(helper, 128 * 1024 * 1024)
+    if platform == "win32" and (identity is None or not _win_verify_trust(helper)):
+        return None
     return (helper.resolve(), identity) if identity is not None else None
+
+
+def _windows_directory() -> Path | None:
+    """Resolve the Windows directory from the kernel, never caller-controlled env."""
+    if os.name != "nt":
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32_768)
+        length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
+    except (AttributeError, OSError):
+        return None
+    if not length or length >= len(buffer):
+        return None
+    return Path(buffer.value)
+
+
+def _win_verify_trust(path: Path) -> bool:
+    """Use WinVerifyTrust directly before trusting PowerShell signature output."""
+    if os.name != "nt":
+        return False
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_ulong),
+            ("Data2", ctypes.c_ushort),
+            ("Data3", ctypes.c_ushort),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class WINTRUST_FILE_INFO(ctypes.Structure):
+        _fields_ = [
+            ("cbStruct", ctypes.c_ulong),
+            ("pcwszFilePath", ctypes.c_wchar_p),
+            ("hFile", ctypes.c_void_p),
+            ("pgKnownSubject", ctypes.c_void_p),
+        ]
+
+    class WINTRUST_DATA(ctypes.Structure):
+        _fields_ = [
+            ("cbStruct", ctypes.c_ulong),
+            ("pPolicyCallbackData", ctypes.c_void_p),
+            ("pSIPClientData", ctypes.c_void_p),
+            ("dwUIChoice", ctypes.c_ulong),
+            ("fdwRevocationChecks", ctypes.c_ulong),
+            ("dwUnionChoice", ctypes.c_ulong),
+            ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
+            ("dwStateAction", ctypes.c_ulong),
+            ("hWVTStateData", ctypes.c_void_p),
+            ("pwszURLReference", ctypes.c_wchar_p),
+            ("dwProvFlags", ctypes.c_ulong),
+            ("dwUIContext", ctypes.c_ulong),
+            ("pSignatureSettings", ctypes.c_void_p),
+        ]
+
+    action = GUID(
+        0x00AAC56B,
+        0xCD44,
+        0x11D0,
+        (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE),
+    )
+    file_info = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), str(path), None, None)
+    trust_data = WINTRUST_DATA(
+        ctypes.sizeof(WINTRUST_DATA),
+        None,
+        None,
+        2,
+        0,
+        1,
+        ctypes.pointer(file_info),
+        0,
+        None,
+        None,
+        0x00001000,
+        0,
+        None,
+    )
+    try:
+        return (
+            ctypes.windll.wintrust.WinVerifyTrust(
+                None, ctypes.byref(action), ctypes.byref(trust_data)
+            )
+            == 0
+        )
+    except (AttributeError, OSError):
+        return False
 
 
 def _host_binary(path: Path, platform: str) -> Path:
@@ -148,12 +237,20 @@ def _host_binary(path: Path, platform: str) -> Path:
     return path
 
 
-def _verified_host_version(path: Path, platform: str, helper: Path) -> str | None:
+def _verified_host_evidence(
+    path: Path, platform: str, helper: Path
+) -> tuple[str, dict[str, str]] | None:
     if platform == "win32":
         script = (
+            "$self=Get-AuthenticodeSignature -LiteralPath $PSHOME\\powershell.exe;"
+            "$selfv=(Get-Item -LiteralPath $PSHOME\\powershell.exe).VersionInfo;"
             "$sig=Get-AuthenticodeSignature -LiteralPath $args[0];"
             "$v=(Get-Item -LiteralPath $args[0]).VersionInfo;"
-            "[pscustomobject]@{status=[string]$sig.Status;"
+            "[pscustomobject]@{helperStatus=[string]$self.Status;"
+            "helperSubject=[string]$self.SignerCertificate.Subject;"
+            "helperProduct=[string]$selfv.ProductName;"
+            "helperOriginal=[string]$selfv.OriginalFilename;"
+            "helperVersion=[string]$selfv.ProductVersion;status=[string]$sig.Status;"
             "subject=[string]$sig.SignerCertificate.Subject;"
             "product=[string]$v.ProductName;original=[string]$v.OriginalFilename;"
             "version=[string]$v.ProductVersion}|ConvertTo-Json -Compress"
@@ -172,6 +269,18 @@ def _verified_host_version(path: Path, platform: str, helper: Path) -> str | Non
         if (
             result.returncode != 0
             or not isinstance(payload, dict)
+            or payload.get("helperStatus") != "Valid"
+            or re.search(
+                r"(?:^|,)\s*CN=Microsoft (?:Windows|Corporation)(?:,|$)",
+                str(payload.get("helperSubject", "")),
+                flags=re.IGNORECASE,
+            )
+            is None
+            or re.search(
+                r"Windows PowerShell", str(payload.get("helperProduct", "")), re.IGNORECASE
+            )
+            is None
+            or str(payload.get("helperOriginal", "")).casefold() != "powershell.exe"
             or payload.get("status") != "Valid"
             or re.search(
                 r"(?:^|,)\s*CN=Adobe (?:Inc\.?|Systems Incorporated)(?:,|$)",
@@ -183,7 +292,17 @@ def _verified_host_version(path: Path, platform: str, helper: Path) -> str | Non
             or str(payload.get("original", "")).casefold() != "afterfx.exe"
         ):
             return None
-        return str(payload.get("version", ""))
+        try:
+            _version_key(str(payload.get("helperVersion", "")))
+        except PreflightError:
+            return None
+        return str(payload.get("version", "")), {
+            "authenticode": "valid",
+            "subject": str(payload.get("helperSubject", "")),
+            "product": str(payload.get("helperProduct", "")),
+            "original": str(payload.get("helperOriginal", "")),
+            "version": str(payload.get("helperVersion", "")),
+        }
     if platform == "darwin":
         try:
             verified = subprocess.run(
@@ -213,7 +332,13 @@ def _verified_host_version(path: Path, platform: str, helper: Path) -> str | Non
             or plist.get("CFBundleIdentifier") != "com.adobe.AfterEffects"
         ):
             return None
-        return str(plist.get("CFBundleShortVersionString", ""))
+        return str(plist.get("CFBundleShortVersionString", "")), {
+            "authenticode": "not_applicable",
+            "subject": "Apple system codesign",
+            "product": "codesign",
+            "original": "codesign",
+            "version": "system",
+        }
     return None
 
 
@@ -239,9 +364,10 @@ def trusted_host_attestation(
     host_identity = _stable_file_identity(_host_binary(path, platform), 2_147_483_647)
     if host_identity is None:
         return None
-    version = _verified_host_version(path, platform, helper)
-    if version is None:
+    evidence = _verified_host_evidence(path, platform, helper)
+    if evidence is None:
         return None
+    version, helper_metadata = evidence
     try:
         _version_key(version)
     except PreflightError:
@@ -250,7 +376,7 @@ def trusted_host_attestation(
         "platform": platform,
         "version": version,
         "host": host_identity,
-        "signature_helper": helper_identity,
+        "signature_helper": {**helper_identity, **helper_metadata},
     }
 
 

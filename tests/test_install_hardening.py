@@ -183,6 +183,11 @@ def test_host_attestation_uses_os_owned_helper_and_detects_later_byte_swaps(
             0,
             stdout=json.dumps(
                 {
+                    "helperStatus": "Valid",
+                    "helperSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                    "helperProduct": "Windows PowerShell",
+                    "helperOriginal": "powershell.exe",
+                    "helperVersion": "10.0.26100.1",
                     "status": "Valid",
                     "subject": "CN=Adobe Inc., O=Adobe Inc.",
                     "product": "Adobe After Effects",
@@ -194,6 +199,8 @@ def test_host_attestation_uses_os_owned_helper_and_detects_later_byte_swaps(
         )
 
     monkeypatch.setattr(install_discovery.subprocess, "run", signed_run)
+    monkeypatch.setattr(install_discovery, "_windows_directory", lambda: system_root)
+    monkeypatch.setattr(install_discovery, "_win_verify_trust", lambda _path: True)
     identity = trusted_host_attestation(
         host,
         "win32",
@@ -210,6 +217,17 @@ def test_host_attestation_uses_os_owned_helper_and_detects_later_byte_swaps(
     host.write_bytes(b"MZtrusted-afterfx")
     helper.write_bytes(b"replaced-helper")
     assert reattest_host(host, identity) is False
+
+    helper.write_bytes(b"trusted-system-powershell")
+    monkeypatch.setattr(install_discovery, "_win_verify_trust", lambda _path: False)
+    assert (
+        trusted_host_attestation(
+            host,
+            "win32",
+            environ={"SystemRoot": str(system_root), "PATH": str(shadow.parent)},
+        )
+        is None
+    )
 
 
 def test_upgrade_rolls_back_payload_and_receipt_when_live_verify_fails(tmp_path: Path) -> None:
@@ -433,6 +451,11 @@ def test_windows_host_trust_requires_adobe_signer_product_and_original_filename(
     monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
     payload = json.dumps(
         {
+            "helperStatus": "Valid",
+            "helperSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+            "helperProduct": "Windows PowerShell",
+            "helperOriginal": "powershell.exe",
+            "helperVersion": "10.0.26100.1",
             "status": "Valid",
             "subject": subject,
             "product": product,
@@ -445,6 +468,8 @@ def test_windows_host_trust_requires_adobe_signer_product_and_original_filename(
         "run",
         lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, payload, ""),
     )
+    monkeypatch.setattr(install_discovery, "_windows_directory", lambda: tmp_path / "Windows")
+    monkeypatch.setattr(install_discovery, "_win_verify_trust", lambda _path: True)
 
     assert _trusted_host_version(host, "win32") == expected
 
