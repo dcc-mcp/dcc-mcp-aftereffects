@@ -8,6 +8,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -38,6 +39,9 @@ _TARGET = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _PUBLISHED_ADOBEPY_RELEASES: dict[tuple[str, str], dict[str, str]] = {
     ("0.6.2", "windows-x64"): {
         "cli_sha256": "c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa",
+        "cli_bytes": "2974720",
+        "manifest_sha256": "3f0cf14b44b1d4c7d98b0175152e7ea58fc3edb92bd61e84983b3ad39de6b554",
+        "manifest_bytes": "663",
         "archive_sha256": "9ef9abb5e034359f12e9ce248b0030e38d34c76df343eb2713f18036068719a7",
         "release_tag": "adobepy-v0.6.2",
         "asset": "adobepy-0.6.2-windows-x64.zip",
@@ -50,6 +54,44 @@ class PreflightError(RuntimeError):
         super().__init__(message)
         self.stage = stage
         self.exit_code = exit_code
+
+
+def _path_uses_link(path: Path) -> bool:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return True
+        if stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            return True
+    return False
+
+
+def _stable_file_bytes(path: Path, maximum: int) -> bytes | None:
+    try:
+        if _path_uses_link(path):
+            return None
+        before = path.stat()
+        if before.st_size <= 0 or before.st_size > maximum:
+            return None
+        contents = path.read_bytes()
+        after = path.stat()
+    except OSError:
+        return None
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        return None
+    return contents
 
 
 def default_extension_path(
@@ -292,6 +334,13 @@ def _resolve_host(
     return resolved_host, version
 
 
+def host_process_executable(host_path: Path) -> Path:
+    """Map a signed macOS application bundle to its exact native process binary."""
+    if host_path.suffix.lower() == ".app":
+        return host_path / "Contents" / "MacOS" / "After Effects"
+    return host_path
+
+
 def _version_key(value: str) -> Version:
     if (
         not isinstance(value, str)
@@ -424,13 +473,17 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
     if not selected:
         return None
     try:
-        path = Path(selected).expanduser().resolve()
-        contents = path.read_bytes()
+        selected_path = Path(selected).expanduser()
+        if _path_uses_link(selected_path):
+            return None
+        path = selected_path.resolve(strict=True)
+        contents = _stable_file_bytes(path, 2_147_483_647)
         bundle = path.parent.parent
         manifest_path = bundle / "package-manifest.json"
-        if manifest_path.stat().st_size > 65_536:
+        manifest_contents = _stable_file_bytes(manifest_path, 65_536)
+        if contents is None or manifest_contents is None:
             return None
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_contents.decode("utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return None
     includes = manifest.get("includes") if isinstance(manifest, dict) else None
@@ -454,6 +507,11 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
         if isinstance(version, str) and isinstance(runtime, str)
         else None
     )
+    try:
+        release_cli_bytes = int(release["cli_bytes"]) if release else -1
+        release_manifest_bytes = int(release["manifest_bytes"]) if release else -1
+    except (KeyError, TypeError, ValueError):
+        return None
     supplied_sha256 = environ.get("ADOBEPY_CLI_SHA256", "").lower()
     actual_sha256 = hashlib.sha256(contents).hexdigest()
     try:
@@ -463,7 +521,10 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
     if (
         not contents
         or not isinstance(release, dict)
+        or len(contents) != release_cli_bytes
         or actual_sha256 != release.get("cli_sha256")
+        or len(manifest_contents) != release_manifest_bytes
+        or hashlib.sha256(manifest_contents).hexdigest() != release.get("manifest_sha256")
         or (
             bool(supplied_sha256)
             and (
@@ -492,6 +553,10 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
         "runtime": runtime,
         "bytes": len(contents),
         "sha256": actual_sha256,
+        "manifest_path": str(manifest_path.resolve()),
+        "manifest_bytes": len(manifest_contents),
+        "manifest_sha256": hashlib.sha256(manifest_contents).hexdigest(),
+        "provenance": "official_checksum_release",
         "source": {
             "repository": "https://github.com/dcc-mcp/adobepy",
             "release_tag": release["release_tag"],
@@ -499,6 +564,40 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
             "archive_sha256": release["archive_sha256"],
         },
     }
+
+
+def reattest_bridge_cli(path: Path, expected: Mapping[str, Any]) -> bool:
+    """Recheck the exact official CLI and manifest immediately before execution."""
+    try:
+        expected_path = Path(expected["executable"]).resolve(strict=True)
+        manifest_path = Path(expected["manifest_path"]).resolve(strict=True)
+        expected_bytes = int(expected["bytes"])
+        expected_manifest_bytes = int(expected["manifest_bytes"])
+        expected_sha256 = expected["sha256"]
+        expected_manifest_sha256 = expected["manifest_sha256"]
+        selected_path = path.resolve(strict=True)
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    if (
+        expected.get("provenance") != "official_checksum_release"
+        or selected_path != expected_path
+        or manifest_path != selected_path.parent.parent / "package-manifest.json"
+        or not isinstance(expected_sha256, str)
+        or not isinstance(expected_manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256) is None
+    ):
+        return False
+    contents = _stable_file_bytes(selected_path, 2_147_483_647)
+    manifest_contents = _stable_file_bytes(manifest_path, 65_536)
+    return bool(
+        contents is not None
+        and manifest_contents is not None
+        and len(contents) == expected_bytes
+        and hashlib.sha256(contents).hexdigest() == expected_sha256
+        and len(manifest_contents) == expected_manifest_bytes
+        and hashlib.sha256(manifest_contents).hexdigest() == expected_manifest_sha256
+    )
 
 
 def _resolve_bridge_cli(environ: Mapping[str, str]) -> Path | None:
@@ -658,5 +757,7 @@ __all__ = [
     "PreflightError",
     "default_extension_path",
     "default_state_dir",
+    "host_process_executable",
+    "reattest_bridge_cli",
     "resolve_install",
 ]

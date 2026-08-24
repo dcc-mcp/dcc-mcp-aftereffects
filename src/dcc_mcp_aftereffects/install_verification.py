@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .install_contract import EXIT_OK, EXIT_VERIFY, SCHEMA_VERSION
-from .install_discovery import PreflightError, _version_key
+from .install_discovery import PreflightError, _version_key, host_process_executable
 from .install_io import (
     read_receipt,
     receipt_files_match,
@@ -264,6 +264,7 @@ def _validate_runtime_identity(
             "The typed After Effects probe omitted broker identity attestation",
             "invalid_identity",
         )
+    expected_host_executable = host_process_executable(resolved.host_path)
     string_fields = (
         "process_start_identity",
         "process_executable",
@@ -308,7 +309,7 @@ def _validate_runtime_identity(
         or identity.get("host_version") != resolved.host_version
         or status.version != resolved.host_version
         or status.target != resolved.target
-        or not _same_path(identity.get("process_executable"), resolved.host_path)
+        or not _same_path(identity.get("process_executable"), expected_host_executable)
         or not _same_path(identity.get("plugin_root"), resolved.extension_path)
     ):
         return _runtime_identity_failure(
@@ -353,7 +354,7 @@ def _validate_runtime_identity(
     if (
         host_before.get("ok") is not True
         or host_before != host_after
-        or not _same_path(host_before.get("executable"), resolved.host_path)
+        or not _same_path(host_before.get("executable"), expected_host_executable)
         or host_before.get("process_start_identity") != identity["process_start_identity"]
         or broker_before.get("ok") is not True
         or broker_before != broker_after
