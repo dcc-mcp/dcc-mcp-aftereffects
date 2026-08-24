@@ -30,7 +30,9 @@ from dcc_mcp_aftereffects.install_discovery import (
     _resolve_host,
     _trusted_host_version,
     _version_key,
+    reattest_host,
     resolve_install,
+    trusted_host_attestation,
 )
 from dcc_mcp_aftereffects.install_io import file_manifest
 from dcc_mcp_aftereffects.install_models import InstallRequest
@@ -125,6 +127,89 @@ def test_manifest_rejects_symlink_that_escapes_bridge(tmp_path: Path) -> None:
 
     with pytest.raises(OSError, match="Unsafe bridge symlink"):
         file_manifest(root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows directory junction")
+def test_manifest_rejects_inner_junction_without_reading_external_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "bridge"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    external = outside / "operator.txt"
+    external.write_bytes(b"operator-owned")
+    junction = root / "linked"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    original_read = Path.read_bytes
+
+    def guarded_read(path: Path) -> bytes:
+        if path.resolve() == external.resolve():
+            raise AssertionError("external junction bytes were read")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read)
+    with pytest.raises(OSError, match="reparse"):
+        file_manifest(root)
+    assert original_read(external) == b"operator-owned"
+
+
+def test_host_attestation_uses_os_owned_helper_and_detects_later_byte_swaps(
+    tmp_path: Path, monkeypatch
+) -> None:
+    system_root = tmp_path / "Windows"
+    helper = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-system-powershell")
+    shadow = tmp_path / "shadow" / "powershell.exe"
+    shadow.parent.mkdir()
+    shadow.write_bytes(b"attacker-shadow")
+    host = tmp_path / "Adobe After Effects 2025" / "Support Files" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZtrusted-afterfx")
+    commands: list[list[str]] = []
+
+    def signed_run(command, **_kwargs):
+        commands.append([str(item) for item in command])
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "status": "Valid",
+                    "subject": "CN=Adobe Inc., O=Adobe Inc.",
+                    "product": "Adobe After Effects",
+                    "original": "AfterFX.exe",
+                    "version": "25.0.0",
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(install_discovery.subprocess, "run", signed_run)
+    identity = trusted_host_attestation(
+        host,
+        "win32",
+        environ={"SystemRoot": str(system_root), "PATH": str(shadow.parent)},
+    )
+
+    assert identity is not None
+    assert Path(commands[0][0]) == helper
+    assert commands[0][0] != str(shadow)
+    assert reattest_host(host, identity) is True
+
+    host.write_bytes(b"MZreplaced-afterfx")
+    assert reattest_host(host, identity) is False
+    host.write_bytes(b"MZtrusted-afterfx")
+    helper.write_bytes(b"replaced-helper")
+    assert reattest_host(host, identity) is False
 
 
 def test_upgrade_rolls_back_payload_and_receipt_when_live_verify_fails(tmp_path: Path) -> None:
@@ -342,6 +427,10 @@ def test_windows_host_trust_requires_adobe_signer_product_and_original_filename(
 ) -> None:
     host = tmp_path / "AfterFX.exe"
     host.write_bytes(b"MZ")
+    helper = tmp_path / "Windows" / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-powershell")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
     payload = json.dumps(
         {
             "status": "Valid",
