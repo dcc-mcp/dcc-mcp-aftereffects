@@ -227,6 +227,7 @@ def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path)
         "write-receipt",
         "verify",
         "receipt",
+        "host-attestation",
         "target-import",
         "typed-readiness",
     ]

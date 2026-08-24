@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .install_contract import EXIT_OK, EXIT_VERIFY, SCHEMA_VERSION
-from .install_discovery import PreflightError, _version_key, host_process_executable
+from .install_discovery import (
+    PreflightError,
+    _version_key,
+    host_process_executable,
+    reattest_host,
+)
 from .install_io import (
     read_receipt,
     receipt_files_match,
@@ -205,6 +210,10 @@ def installation_state(resolved: ResolvedInstall) -> tuple[str, dict[str, Any] |
         receipt.get("receipt_version") != 1
         or receipt.get("host_path") != str(resolved.host_path)
         or receipt.get("host_version") != resolved.host_version
+        or (
+            bool(resolved.host_identity)
+            and receipt.get("host_identity") != dict(resolved.host_identity)
+        )
         or receipt.get("python") != str(resolved.python_path)
         or receipt.get("python_version") != resolved.python_version
         or receipt.get("target") != resolved.target
@@ -390,6 +399,22 @@ def verify_install(
             ),
             EXIT_VERIFY,
         )
+    if resolved.host_identity and not reattest_host(resolved.host_path, resolved.host_identity):
+        reason = "The signed After Effects host or OS signature helper changed after preflight"
+        steps.append({"id": "host-attestation", "status": "failed", "message": reason})
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                failure_stage="host_attestation",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_VERIFY,
+        )
+    steps.append({"id": "host-attestation", "status": "ok"})
     import_ok, import_reason = dependencies.import_probe(resolved.python_path)
     steps.append(
         {

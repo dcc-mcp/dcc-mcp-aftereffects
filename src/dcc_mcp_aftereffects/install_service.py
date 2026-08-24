@@ -144,6 +144,7 @@ def _install_or_upgrade(
             "core_version": resolved.core_version,
             "host_path": str(resolved.host_path),
             "host_version": resolved.host_version,
+            "host_identity": dict(resolved.host_identity),
             "python": str(resolved.python_path),
             "python_version": resolved.python_version,
             "extension_path": str(resolved.extension_path),

@@ -33,6 +33,7 @@ class ResolvedInstall:
     target: str = "default"
     python_modules: Mapping[str, Any] = field(default_factory=dict)
     bridge_identity: Mapping[str, Any] = field(default_factory=dict)
+    host_identity: Mapping[str, Any] = field(default_factory=dict)
 
 
 __all__ = ["InstallRequest", "ResolvedInstall"]

@@ -94,6 +94,179 @@ def _stable_file_bytes(path: Path, maximum: int) -> bytes | None:
     return contents
 
 
+def _stable_file_identity(path: Path, maximum: int) -> dict[str, Any] | None:
+    try:
+        if _path_uses_link(path):
+            return None
+        before = path.stat()
+        if before.st_size <= 0 or before.st_size > maximum:
+            return None
+        digest = hashlib.sha256()
+        observed = 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                observed += len(chunk)
+                if observed > maximum:
+                    return None
+                digest.update(chunk)
+        after = path.stat()
+    except OSError:
+        return None
+    if observed != before.st_size or (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        return None
+    return {
+        "path": str(path.resolve()),
+        "bytes": observed,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _signature_helper(
+    platform: str, environ: Mapping[str, str]
+) -> tuple[Path, dict[str, Any]] | None:
+    if platform == "win32":
+        system_root = environ.get("SystemRoot") or environ.get("SYSTEMROOT")
+        if not system_root:
+            return None
+        helper = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    elif platform == "darwin":
+        helper = Path("/usr/bin/codesign")
+    else:
+        return None
+    identity = _stable_file_identity(helper, 128 * 1024 * 1024)
+    return (helper.resolve(), identity) if identity is not None else None
+
+
+def _host_binary(path: Path, platform: str) -> Path:
+    if platform == "darwin":
+        return path / "Contents" / "MacOS" / "After Effects"
+    return path
+
+
+def _verified_host_version(path: Path, platform: str, helper: Path) -> str | None:
+    if platform == "win32":
+        script = (
+            "$sig=Get-AuthenticodeSignature -LiteralPath $args[0];"
+            "$v=(Get-Item -LiteralPath $args[0]).VersionInfo;"
+            "[pscustomobject]@{status=[string]$sig.Status;"
+            "subject=[string]$sig.SignerCertificate.Subject;"
+            "product=[string]$v.ProductName;original=[string]$v.OriginalFilename;"
+            "version=[string]$v.ProductVersion}|ConvertTo-Json -Compress"
+        )
+        try:
+            result = subprocess.run(
+                [str(helper), "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError, UnicodeError):
+            return None
+        if (
+            result.returncode != 0
+            or not isinstance(payload, dict)
+            or payload.get("status") != "Valid"
+            or re.search(
+                r"(?:^|,)\s*CN=Adobe (?:Inc\.?|Systems Incorporated)(?:,|$)",
+                str(payload.get("subject", "")),
+                flags=re.IGNORECASE,
+            )
+            is None
+            or re.search(r"After Effects", str(payload.get("product", "")), re.IGNORECASE) is None
+            or str(payload.get("original", "")).casefold() != "afterfx.exe"
+        ):
+            return None
+        return str(payload.get("version", ""))
+    if platform == "darwin":
+        try:
+            verified = subprocess.run(
+                [str(helper), "--verify", "--deep", "--strict", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            details = subprocess.run(
+                [str(helper), "-dv", "--verbose=4", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            with (path / "Contents" / "Info.plist").open("rb") as handle:
+                plist = plistlib.load(handle)
+        except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException):
+            return None
+        signature = (details.stdout or "") + (details.stderr or "")
+        if (
+            verified.returncode != 0
+            or details.returncode != 0
+            or "TeamIdentifier=JQ525L2MZD" not in signature
+            or "Identifier=com.adobe.AfterEffects" not in signature
+            or plist.get("CFBundleIdentifier") != "com.adobe.AfterEffects"
+        ):
+            return None
+        return str(plist.get("CFBundleShortVersionString", ""))
+    return None
+
+
+def trusted_host_attestation(
+    path: Path,
+    platform: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    helper_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Bind Adobe signature evidence to exact OS helper and host bytes."""
+    active_env = os.environ if environ is None else environ
+    if helper_path is None:
+        selected = _signature_helper(platform, active_env)
+        if selected is None:
+            return None
+        helper, helper_identity = selected
+    else:
+        helper = helper_path
+        helper_identity = _stable_file_identity(helper, 128 * 1024 * 1024)
+        if helper_identity is None:
+            return None
+    host_identity = _stable_file_identity(_host_binary(path, platform), 2_147_483_647)
+    if host_identity is None:
+        return None
+    version = _verified_host_version(path, platform, helper)
+    if version is None:
+        return None
+    try:
+        _version_key(version)
+    except PreflightError:
+        return None
+    return {
+        "platform": platform,
+        "version": version,
+        "host": host_identity,
+        "signature_helper": helper_identity,
+    }
+
+
+def reattest_host(path: Path, expected: Mapping[str, Any]) -> bool:
+    """Re-run signature verification and byte binding immediately before readiness."""
+    try:
+        platform = expected["platform"]
+        helper = Path(expected["signature_helper"]["path"])
+    except (KeyError, TypeError):
+        return False
+    if not isinstance(platform, str):
+        return False
+    current = trusted_host_attestation(path, platform, helper_path=helper)
+    return current == dict(expected)
+
+
 def default_extension_path(
     *,
     platform: str | None = None,
@@ -159,78 +332,8 @@ def _host_candidates(platform: str, environ: Mapping[str, str]) -> list[Path]:
 
 def _trusted_host_version(path: Path, platform: str) -> str | None:
     """Return product-derived version only for a platform-verified Adobe binary."""
-    if platform == "win32":
-        script = (
-            "$sig=Get-AuthenticodeSignature -LiteralPath $args[0];"
-            "$v=(Get-Item -LiteralPath $args[0]).VersionInfo;"
-            "[pscustomobject]@{status=[string]$sig.Status;"
-            "subject=[string]$sig.SignerCertificate.Subject;"
-            "product=[string]$v.ProductName;original=[string]$v.OriginalFilename;"
-            "version=[string]$v.ProductVersion}|ConvertTo-Json -Compress"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            payload = json.loads(result.stdout)
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError, UnicodeError):
-            return None
-        if (
-            result.returncode != 0
-            or not isinstance(payload, dict)
-            or payload.get("status") != "Valid"
-            or re.search(
-                r"(?:^|,)\s*CN=Adobe (?:Inc\.?|Systems Incorporated)(?:,|$)",
-                str(payload.get("subject", "")),
-                flags=re.IGNORECASE,
-            )
-            is None
-            or re.search(r"After Effects", str(payload.get("product", "")), re.IGNORECASE) is None
-            or str(payload.get("original", "")).casefold() != "afterfx.exe"
-        ):
-            return None
-        version = str(payload.get("version", ""))
-    elif platform == "darwin":
-        try:
-            verified = subprocess.run(
-                ["codesign", "--verify", "--deep", "--strict", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            details = subprocess.run(
-                ["codesign", "-dv", "--verbose=4", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            with (path / "Contents" / "Info.plist").open("rb") as handle:
-                plist = plistlib.load(handle)
-        except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException):
-            return None
-        signature = (details.stdout or "") + (details.stderr or "")
-        if (
-            verified.returncode != 0
-            or details.returncode != 0
-            or "TeamIdentifier=JQ525L2MZD" not in signature
-            or "Identifier=com.adobe.AfterEffects" not in signature
-            or plist.get("CFBundleIdentifier") != "com.adobe.AfterEffects"
-        ):
-            return None
-        version = str(plist.get("CFBundleShortVersionString", ""))
-    else:
-        return None
-    try:
-        _version_key(version)
-    except PreflightError:
-        return None
-    return version
+    identity = trusted_host_attestation(path, platform)
+    return str(identity["version"]) if identity is not None else None
 
 
 def _host_version(path: Path) -> str:
@@ -614,6 +717,7 @@ def resolve_install(
     active_platform = platform or sys.platform
     active_env = os.environ if environ is None else environ
     host_path, host_version = _resolve_host(request, active_platform, active_env)
+    host_identity = trusted_host_attestation(host_path, active_platform, environ=active_env) or {}
     python_path = Path(request.python or sys.executable).expanduser()
     if not python_path.is_file():
         raise PreflightError("python", f"Target Python does not exist: {python_path}")
@@ -746,6 +850,7 @@ def resolve_install(
         target=target,
         python_modules=modules,
         bridge_identity=bridge_identity or {},
+        host_identity=host_identity,
     )
 
 

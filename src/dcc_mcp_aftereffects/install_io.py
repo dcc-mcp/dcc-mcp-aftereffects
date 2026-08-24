@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -77,11 +78,35 @@ def _safe_symlink_target(link_path: str, target: Any) -> bool:
 def file_manifest(root: Path) -> list[dict[str, Any]]:
     manifest: list[dict[str, Any]] = []
     total_bytes = 0
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+
+    def visit(directory: Path) -> Iterator[Path]:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as exc:
+            raise OSError("Bridge directory could not be inspected safely") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise OSError("Bridge entry could not be inspected safely") from exc
+            is_link = stat.S_ISLNK(metadata.st_mode)
+            is_reparse = bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            if is_reparse and not is_link:
+                raise OSError("Bridge contains an unsupported directory reparse point")
+            yield path
+            if stat.S_ISDIR(metadata.st_mode):
+                yield from visit(path)
+
+    for path in visit(root):
         if len(manifest) >= 4_096:
             raise OSError("Bridge contains too many owned entries")
         relative = path.relative_to(root).as_posix()
-        if path.is_symlink():
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
             target = os.readlink(path)
             if not _safe_symlink_target(relative, target):
                 raise OSError(f"Unsafe bridge symlink target: {relative}")
@@ -95,7 +120,7 @@ def file_manifest(root: Path) -> list[dict[str, Any]]:
                     "sha256": _sha256(contents),
                 }
             )
-        elif path.is_dir():
+        elif stat.S_ISDIR(metadata.st_mode):
             manifest.append(
                 {
                     "path": relative,
@@ -104,11 +129,24 @@ def file_manifest(root: Path) -> list[dict[str, Any]]:
                     "sha256": _sha256(("directory\0" + relative).encode("utf-8")),
                 }
             )
-        elif path.is_file():
-            size = path.stat().st_size
+        elif stat.S_ISREG(metadata.st_mode):
+            size = metadata.st_size
             if size < 0 or size > 64 * 1024 * 1024 or total_bytes + size > 256 * 1024 * 1024:
                 raise OSError(f"Bridge file exceeds bounded receipt limits: {relative}")
             contents = path.read_bytes()
+            after = path.lstat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ):
+                raise OSError(f"Bridge file changed during receipt capture: {relative}")
             total_bytes += len(contents)
             entry = {
                 "path": relative,
