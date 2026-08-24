@@ -70,12 +70,72 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
 
 
 def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
+    host_pid = 41_001
+    broker_pid = 41_002
+
+    def readiness(resolved: ResolvedInstall) -> AfterEffectsStatus:
+        return AfterEffectsStatus(
+            True,
+            version=resolved.host_version,
+            target=resolved.target,
+            identity={
+                "host": "after-effects",
+                "bridge_kind": "cep",
+                "target": resolved.target,
+                "host_version": resolved.host_version,
+                "bridge_version": "0.6.2",
+                "host_pid": host_pid,
+                "process_start_identity": "test-host-start:41001",
+                "process_executable": str(resolved.host_path),
+                "instance_id": "after-effects-test-instance",
+                "profile_id": "cep-test-profile",
+                "plugin_root": str(resolved.extension_path),
+                "plugin_module_origin": str(resolved.extension_path / "manifest.xml"),
+                "connected_at_epoch_ms": 1_777_777_777_000,
+                "broker": {
+                    "pid": broker_pid,
+                    "process_start_identity": "test-broker-start:41002",
+                    "executable": str(resolved.adobepy_cli),
+                    "version": "0.6.2",
+                    "instance_id": "adobepy-test-instance",
+                },
+            },
+        )
+
+    def process_probe(pid: int):
+        if pid == host_pid:
+            return {
+                "ok": True,
+                "executable": None,
+                "process_start_identity": "test-host-start:41001",
+            }
+        if pid == broker_pid:
+            return {
+                "ok": True,
+                "executable": None,
+                "process_start_identity": "test-broker-start:41002",
+            }
+        return {"ok": False}
+
+    def bound_process_probe(pid: int, resolved: ResolvedInstall):
+        result = process_probe(pid)
+        if pid == host_pid:
+            result["executable"] = str(resolved.host_path)
+        elif pid == broker_pid:
+            result["executable"] = str(resolved.adobepy_cli)
+        return result
+
+    current: dict[str, ResolvedInstall] = {}
+
+    def bound_readiness(resolved: ResolvedInstall) -> AfterEffectsStatus:
+        current["resolved"] = resolved
+        return readiness(resolved)
+
     return LifecycleDependencies(
         bridge_runner=runner,
         import_probe=lambda _python: (True, "adapter imports passed"),
-        readiness_probe=lambda _resolved: AfterEffectsStatus(
-            True, version="24.6", target="default"
-        ),
+        readiness_probe=bound_readiness,
+        process_probe=lambda pid: bound_process_probe(pid, current["resolved"]),
     )
 
 
@@ -153,7 +213,9 @@ def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path)
     assert secret not in " ".join(command)
     assert kwargs["env"]["ADOBEPY_TOKEN"] == secret
     config_entry = next(item for item in receipt["files"] if item["path"] == "adobepy.config.js")
-    assert "sha256" not in config_entry
+    assert config_entry["type"] == "file"
+    assert config_entry["sensitive"] is True
+    assert len(config_entry["sha256"]) == 64
     assert secret not in json.dumps(receipt)
     for report in (install_report, status_report, verify_report, uninstall_report):
         assert secret not in json.dumps(report)
@@ -200,20 +262,15 @@ def test_broker_url_credentials_never_reach_the_external_process(tmp_path):
 
 def test_upgrade_rolls_back_when_receipt_commit_fails(tmp_path):
     resolved = resolved_install(tmp_path)
-    resolved.extension_path.mkdir(parents=True)
-    (resolved.extension_path / "old.js").write_text("old", encoding="utf-8")
-    resolved.receipt_path.parent.mkdir(parents=True)
-    resolved.receipt_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "dcc_type": "aftereffects",
-                "extension_path": str(resolved.extension_path),
-                "files": [{"path": "old.js", "sha256": "stale"}],
-            }
-        ),
-        encoding="utf-8",
+    initial_dependencies = healthy_dependencies(BridgeRunner())
+    _, initial_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=initial_dependencies,
     )
+    assert initial_exit == EXIT_OK
+    old_manifest = (resolved.extension_path / "manifest.xml").read_bytes()
+    old_receipt = resolved.receipt_path.read_bytes()
     dependencies = healthy_dependencies(BridgeRunner())
     dependencies.receipt_writer = lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
 
@@ -225,8 +282,8 @@ def test_upgrade_rolls_back_when_receipt_commit_fails(tmp_path):
 
     assert exit_code == EXIT_INSTALL
     assert report["verify"]["failure_stage"] == "rollback"
-    assert (resolved.extension_path / "old.js").read_text(encoding="utf-8") == "old"
-    assert not (resolved.extension_path / "manifest.xml").exists()
+    assert (resolved.extension_path / "manifest.xml").read_bytes() == old_manifest
+    assert resolved.receipt_path.read_bytes() == old_receipt
 
 
 def test_uninstall_without_a_receipt_never_deletes_partial_files(tmp_path):

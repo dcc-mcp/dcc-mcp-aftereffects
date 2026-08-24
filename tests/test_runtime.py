@@ -44,12 +44,16 @@ def test_probe_verifies_a_real_host_call():
 
     status = probe_aftereffects(
         client=client,
-        app_factory=lambda **_kwargs: SimpleNamespace(version="24.6.2x2"),
+        app_factory=lambda **_kwargs: SimpleNamespace(
+            version="24.6.2",
+            runtime_identity={"host": "after-effects", "bridge_kind": "cep"},
+        ),
     )
 
     assert status.ready is True
-    assert status.version == "24.6.2x2"
+    assert status.version == "24.6.2"
     assert status.target == "default"
+    assert status.identity == {"host": "after-effects", "bridge_kind": "cep"}
 
 
 def test_probe_reports_host_call_failure_without_claiming_readiness():
@@ -61,4 +65,5 @@ def test_probe_reports_host_call_failure_without_claiming_readiness():
     status = probe_aftereffects(client=client, app_factory=fail)
 
     assert status.ready is False
-    assert status.reason == "host unavailable"
+    assert status.reason == "typed After Effects runtime probe failed"
+    assert status.error_type == "host_rpc_failed"

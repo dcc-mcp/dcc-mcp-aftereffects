@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -9,18 +10,39 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
-from typing import Mapping
+from pathlib import Path, PurePosixPath
+from typing import Any, Mapping
+from urllib.parse import urlparse
 
 from packaging.version import InvalidVersion, Version
 
-from .install_contract import EXIT_ACQUIRE, EXIT_PREFLIGHT
+from .install_contract import (
+    EXIT_ACQUIRE,
+    EXIT_PREFLIGHT,
+    INSTALL_SOP_SCHEMA_ID,
+    INSTALL_SOP_SCHEMA_SHA256,
+    INSTALL_SOP_SCHEMA_SIZE,
+)
 from .install_models import InstallRequest, ResolvedInstall
 
 MIN_HOST_VERSION = Version("24.0")
 MIN_PYTHON_VERSION = Version("3.9")
-MIN_CORE_VERSION = Version("0.19.91")
-MIN_ADOBEPY_VERSION = Version("0.6.1")
+MIN_CORE_VERSION = Version("0.20.14")
+MIN_ADOBEPY_VERSION = Version("0.6.2")
+_MAX_VERSION_LENGTH = 39
+_FINAL_VERSION = re.compile(
+    r"(0|[1-9][0-9]{0,8})(?:\.(0|[1-9][0-9]{0,8}))?"
+    r"(?:\.(0|[1-9][0-9]{0,8}))?(?:\.(0|[1-9][0-9]{0,8}))?"
+)
+_TARGET = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_PUBLISHED_ADOBEPY_RELEASES: dict[tuple[str, str], dict[str, str]] = {
+    ("0.6.2", "windows-x64"): {
+        "cli_sha256": "c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa",
+        "archive_sha256": "9ef9abb5e034359f12e9ce248b0030e38d34c76df343eb2713f18036068719a7",
+        "release_tag": "adobepy-v0.6.2",
+        "asset": "adobepy-0.6.2-windows-x64.zip",
+    }
+}
 
 
 class PreflightError(RuntimeError):
@@ -93,6 +115,82 @@ def _host_candidates(platform: str, environ: Mapping[str, str]) -> list[Path]:
     return []
 
 
+def _trusted_host_version(path: Path, platform: str) -> str | None:
+    """Return product-derived version only for a platform-verified Adobe binary."""
+    if platform == "win32":
+        script = (
+            "$sig=Get-AuthenticodeSignature -LiteralPath $args[0];"
+            "$v=(Get-Item -LiteralPath $args[0]).VersionInfo;"
+            "[pscustomobject]@{status=[string]$sig.Status;"
+            "subject=[string]$sig.SignerCertificate.Subject;"
+            "product=[string]$v.ProductName;original=[string]$v.OriginalFilename;"
+            "version=[string]$v.ProductVersion}|ConvertTo-Json -Compress"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError, UnicodeError):
+            return None
+        if (
+            result.returncode != 0
+            or not isinstance(payload, dict)
+            or payload.get("status") != "Valid"
+            or re.search(
+                r"(?:^|,)\s*CN=Adobe (?:Inc\.?|Systems Incorporated)(?:,|$)",
+                str(payload.get("subject", "")),
+                flags=re.IGNORECASE,
+            )
+            is None
+            or re.search(r"After Effects", str(payload.get("product", "")), re.IGNORECASE) is None
+            or str(payload.get("original", "")).casefold() != "afterfx.exe"
+        ):
+            return None
+        version = str(payload.get("version", ""))
+    elif platform == "darwin":
+        try:
+            verified = subprocess.run(
+                ["codesign", "--verify", "--deep", "--strict", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            details = subprocess.run(
+                ["codesign", "-dv", "--verbose=4", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            with (path / "Contents" / "Info.plist").open("rb") as handle:
+                plist = plistlib.load(handle)
+        except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException):
+            return None
+        signature = (details.stdout or "") + (details.stderr or "")
+        if (
+            verified.returncode != 0
+            or details.returncode != 0
+            or "TeamIdentifier=JQ525L2MZD" not in signature
+            or "Identifier=com.adobe.AfterEffects" not in signature
+            or plist.get("CFBundleIdentifier") != "com.adobe.AfterEffects"
+        ):
+            return None
+        version = str(plist.get("CFBundleShortVersionString", ""))
+    else:
+        return None
+    try:
+        _version_key(version)
+    except PreflightError:
+        return None
+    return version
+
+
 def _host_version(path: Path) -> str:
     if path.suffix.lower() == ".app":
         plist_path = path / "Contents" / "Info.plist"
@@ -100,14 +198,17 @@ def _host_version(path: Path) -> str:
             with plist_path.open("rb") as handle:
                 value = plistlib.load(handle).get("CFBundleShortVersionString")
             if value:
+                _version_key(str(value))
                 return str(value)
     text = str(path)
     explicit = re.search(r"After Effects\s+(20\d{2})", text, flags=re.IGNORECASE)
     if explicit:
         return f"{int(explicit.group(1)) - 2000}.0"
-    release = re.search(r"(?:^|[^\d])(\d{2}(?:\.\d+)+)(?:[^\d]|$)", text)
+    release = re.search(r"(?:^|[^\d])(\d{2}(?:\.\d+){1,3})(?:[^\d]|$)", text)
     if release:
-        return release.group(1)
+        value = release.group(1)
+        _version_key(value)
+        return value
     raise PreflightError(
         "host_version",
         "Could not determine the After Effects version from the selected installation",
@@ -127,31 +228,167 @@ def _resolve_host(
                 "After Effects was not found; pass the exact executable or application with --dcc-path",
             )
         host_path = sorted(candidates, key=lambda item: _version_key(_host_version(item)))[-1]
-    if not host_path.exists():
+    if not host_path.exists() or host_path.is_symlink():
         raise PreflightError("host", f"After Effects path does not exist: {host_path}")
-    version = _host_version(host_path)
+    resolved_host = host_path.resolve()
+    if platform == "win32":
+        try:
+            native_host = resolved_host.read_bytes()[:2] == b"MZ"
+        except OSError:
+            native_host = False
+        canonical = bool(
+            resolved_host.is_file()
+            and resolved_host.name.casefold() == "afterfx.exe"
+            and resolved_host.parent.name.casefold() == "support files"
+            and native_host
+            and re.fullmatch(
+                r"Adobe After Effects 20\d{2}",
+                resolved_host.parent.parent.name,
+                flags=re.IGNORECASE,
+            )
+        )
+    elif platform == "darwin":
+        executable = resolved_host / "Contents" / "MacOS" / "After Effects"
+        try:
+            magic = executable.read_bytes()[:4]
+        except OSError:
+            magic = b""
+        canonical = bool(
+            resolved_host.is_dir()
+            and re.fullmatch(
+                r"Adobe After Effects 20\d{2}\.app",
+                resolved_host.name,
+                flags=re.IGNORECASE,
+            )
+            and (resolved_host / "Contents" / "Info.plist").is_file()
+            and executable.is_file()
+            and magic
+            in {
+                b"\xfe\xed\xfa\xce",
+                b"\xce\xfa\xed\xfe",
+                b"\xfe\xed\xfa\xcf",
+                b"\xcf\xfa\xed\xfe",
+                b"\xca\xfe\xba\xbe",
+            }
+        )
+    else:
+        canonical = False
+    if not canonical:
+        raise PreflightError(
+            "host",
+            "--dcc-path must select a canonical After Effects AfterFX.exe or application bundle",
+        )
+    version = _trusted_host_version(resolved_host, platform)
+    if version is None:
+        raise PreflightError(
+            "host",
+            "After Effects product metadata or platform signature could not be verified",
+        )
     if _version_key(version) < MIN_HOST_VERSION:
         raise PreflightError(
             "host_version",
             f"After Effects {version} is unsupported; version {MIN_HOST_VERSION} or newer is required",
         )
-    return host_path.resolve(), version
+    return resolved_host, version
 
 
 def _version_key(value: str) -> Version:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_VERSION_LENGTH
+        or _FINAL_VERSION.fullmatch(value) is None
+    ):
+        raise PreflightError("version", "Version value is not a bounded canonical final release")
     try:
         return Version(value)
     except InvalidVersion as exc:
         raise PreflightError("version", f"Invalid version value: {value}") from exc
 
 
-def _python_metadata(python_path: Path) -> dict[str, str]:
-    script = (
-        "import importlib.metadata as m,json,sys;"
-        "import adobe,dcc_mcp_core;"
-        "print(json.dumps({'python':'.'.join(map(str,sys.version_info[:3])),"
-        "'core':str(dcc_mcp_core.__version__),'adobepy':m.version('adobepy')}))"
+def _python_metadata(python_path: Path) -> dict[str, Any]:
+    script = r"""
+import hashlib
+import importlib.metadata as metadata
+import importlib.resources as resources
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+import adobe.after_effects
+import dcc_mcp_aftereffects
+import dcc_mcp_core
+
+
+def describe(distribution_name, package_name, module):
+    distribution = metadata.distribution(distribution_name)
+    module_path = pathlib.Path(module.__file__).resolve()
+    record_paths = {
+        pathlib.Path(distribution.locate_file(item)).resolve()
+        for item in tuple(distribution.files or ())
+    }
+    record_owned = module_path in record_paths
+    editable_root = None
+    try:
+        raw = distribution.read_text("direct_url.json")
+        direct_url = json.loads(raw) if raw else None
+        url = direct_url.get("url") if isinstance(direct_url, dict) else None
+        editable = (
+            direct_url.get("dir_info", {}).get("editable") is True
+            if isinstance(direct_url, dict)
+            else False
+        )
+        parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+        if editable and parsed and parsed.scheme == "file" and not parsed.query and not parsed.fragment:
+            editable_root = pathlib.Path(
+                urllib.request.url2pathname(urllib.parse.unquote(parsed.path))
+            ).resolve()
+    except Exception:
+        editable_root = None
+    editable_owned = bool(
+        editable_root
+        and module_path
+        in {
+            editable_root / "src" / pathlib.Path(*package_name.split(".")) / "__init__.py",
+            editable_root / pathlib.Path(*package_name.split(".")) / "__init__.py",
+        }
     )
+    return {
+        "distribution": distribution_name,
+        "version": distribution.version,
+        "module_path": str(module_path),
+        "owned": record_owned or editable_owned,
+    }
+
+
+filename = "adapter-install-sop-v1.schema.json"
+schema_bytes = resources.read_binary("dcc_mcp_core.schemas", filename)
+schema = json.loads(schema_bytes.decode("utf-8"))
+core_distribution = metadata.distribution("dcc-mcp-core")
+record_path = "dcc_mcp_core/schemas/" + filename
+print(json.dumps({
+    "python": ".".join(map(str, sys.version_info[:3])),
+    "python_executable": sys.executable,
+    "modules": {
+        "adapter": describe(
+            "dcc-mcp-aftereffects", "dcc_mcp_aftereffects", dcc_mcp_aftereffects
+        ),
+        "core": describe("dcc-mcp-core", "dcc_mcp_core", dcc_mcp_core),
+        "adobepy": describe("adobepy", "adobe.after_effects", adobe.after_effects),
+    },
+    "core_schema": {
+        "id": schema.get("$id"),
+        "size": len(schema_bytes),
+        "sha256": hashlib.sha256(schema_bytes).hexdigest(),
+        "record_owned": any(
+            str(item).replace("\\", "/") == record_path
+            for item in tuple(core_distribution.files or ())
+        ),
+    },
+}))
+""".strip()
     environment = dict(os.environ)
     environment.pop("ADOBEPY_TOKEN", None)
     try:
@@ -164,25 +401,109 @@ def _python_metadata(python_path: Path) -> dict[str, str]:
             env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise PreflightError("python", f"Target Python could not be inspected: {exc}") from exc
+        raise PreflightError("python", "Target Python could not be inspected safely") from exc
     if completed.returncode != 0:
         raise PreflightError(
             "python",
             "Target Python must import adobepy and dcc-mcp-core before host installation",
         )
     try:
-        return json.loads(completed.stdout)
-    except (json.JSONDecodeError, TypeError) as exc:
+        if len((completed.stdout or "").encode("utf-8", errors="replace")) > 262_144:
+            raise ValueError("unbounded output")
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError, UnicodeError, ValueError) as exc:
         raise PreflightError("python", "Target Python returned invalid preflight metadata") from exc
+    if not isinstance(payload, dict):
+        raise PreflightError("python", "Target Python returned invalid preflight metadata")
+    return payload
 
 
-def _resolve_bridge_cli(environ: Mapping[str, str]) -> Path | None:
+def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
     configured = environ.get("ADOBEPY_CLI")
     selected = configured or shutil.which("adobepy")
     if not selected:
         return None
-    path = Path(selected).expanduser()
-    return path.resolve() if path.is_file() else None
+    try:
+        path = Path(selected).expanduser().resolve()
+        contents = path.read_bytes()
+        bundle = path.parent.parent
+        manifest_path = bundle / "package-manifest.json"
+        if manifest_path.stat().st_size > 65_536:
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    includes = manifest.get("includes") if isinstance(manifest, dict) else None
+    relative_cli = f"bin/{path.name}"
+    safe_includes = bool(
+        isinstance(includes, list)
+        and includes
+        and all(
+            isinstance(item, str)
+            and 0 < len(item) <= 256
+            and "\\" not in item
+            and not PurePosixPath(item).is_absolute()
+            and ".." not in PurePosixPath(item).parts
+            for item in includes
+        )
+    )
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    runtime = manifest.get("runtime") if isinstance(manifest, dict) else None
+    release = (
+        _PUBLISHED_ADOBEPY_RELEASES.get((version, runtime))
+        if isinstance(version, str) and isinstance(runtime, str)
+        else None
+    )
+    supplied_sha256 = environ.get("ADOBEPY_CLI_SHA256", "").lower()
+    actual_sha256 = hashlib.sha256(contents).hexdigest()
+    try:
+        _version_key(version)
+    except PreflightError:
+        return None
+    if (
+        not contents
+        or not isinstance(release, dict)
+        or actual_sha256 != release.get("cli_sha256")
+        or (
+            bool(supplied_sha256)
+            and (
+                re.fullmatch(r"[0-9a-f]{64}", supplied_sha256) is None
+                or supplied_sha256 != actual_sha256
+            )
+        )
+        or path.is_symlink()
+        or path.name.casefold() not in {"adobepy", "adobepy.exe"}
+        or path.parent.name != "bin"
+        or manifest.get("name") != "adobepy"
+        or not isinstance(runtime, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,64}", runtime) is None
+        or not safe_includes
+        or relative_cli not in includes
+        or re.fullmatch(
+            rf"adobepy-{re.escape(version)}-[A-Za-z0-9._-]+",
+            bundle.name,
+        )
+        is None
+    ):
+        return None
+    return {
+        "executable": str(path),
+        "version": version,
+        "runtime": runtime,
+        "bytes": len(contents),
+        "sha256": actual_sha256,
+        "source": {
+            "repository": "https://github.com/dcc-mcp/adobepy",
+            "release_tag": release["release_tag"],
+            "asset": release["asset"],
+            "archive_sha256": release["archive_sha256"],
+        },
+    }
+
+
+def _resolve_bridge_cli(environ: Mapping[str, str]) -> Path | None:
+    identity = _bridge_cli_identity(environ)
+    return Path(identity["executable"]) if identity else None
 
 
 def resolve_install(
@@ -197,7 +518,57 @@ def resolve_install(
     python_path = Path(request.python or sys.executable).expanduser()
     if not python_path.is_file():
         raise PreflightError("python", f"Target Python does not exist: {python_path}")
+    python_path = python_path.resolve()
     metadata = _python_metadata(python_path)
+    try:
+        reported_python = Path(metadata["python_executable"]).resolve()
+        modules = metadata["modules"]
+        core_schema = metadata["core_schema"]
+    except (KeyError, OSError, TypeError) as exc:
+        raise PreflightError("python", "Target Python omitted its runtime provenance") from exc
+    if reported_python != python_path.resolve() or not isinstance(modules, dict):
+        raise PreflightError(
+            "python", "Target Python identity does not match the selected executable"
+        )
+    expected_distributions = {
+        "adapter": "dcc-mcp-aftereffects",
+        "core": "dcc-mcp-core",
+        "adobepy": "adobepy",
+    }
+    for key, distribution in expected_distributions.items():
+        module = modules.get(key)
+        module_path = module.get("module_path") if isinstance(module, dict) else None
+        try:
+            trusted_module_path = bool(
+                isinstance(module_path, str)
+                and 0 < len(module_path) <= 4_096
+                and "\0" not in module_path
+                and Path(module_path).is_file()
+            )
+        except (OSError, ValueError):
+            trusted_module_path = False
+        if (
+            not isinstance(module, dict)
+            or module.get("distribution") != distribution
+            or module.get("owned") is not True
+            or not trusted_module_path
+        ):
+            raise PreflightError(
+                "python", "Target Python imports are not owned by their selected distributions"
+            )
+        _version_key(module.get("version"))
+    if (
+        not isinstance(core_schema, dict)
+        or core_schema.get("id") != INSTALL_SOP_SCHEMA_ID
+        or core_schema.get("size") != INSTALL_SOP_SCHEMA_SIZE
+        or core_schema.get("sha256") != INSTALL_SOP_SCHEMA_SHA256
+        or core_schema.get("record_owned") is not True
+    ):
+        raise PreflightError(
+            "core", "Target Core does not contain the canonical Install SOP schema"
+        )
+    metadata["core"] = modules["core"]["version"]
+    metadata["adobepy"] = modules["adobepy"]["version"]
     for name, minimum in (
         ("python", MIN_PYTHON_VERSION),
         ("core", MIN_CORE_VERSION),
@@ -217,19 +588,50 @@ def resolve_install(
         else default_extension_path(platform=active_platform, environ=active_env)
     )
     state_dir = default_state_dir(platform=active_platform, environ=active_env)
-    bridge_cli = _resolve_bridge_cli(active_env)
-    if request.command in {"install", "upgrade"} and bridge_cli is None:
+    bridge_identity = _bridge_cli_identity(active_env)
+    bridge_cli = Path(bridge_identity["executable"]) if bridge_identity else None
+    if request.command in {"install", "upgrade", "verify"} and bridge_cli is None:
         raise PreflightError(
             "acquire",
             "The supported adobepy CLI is unavailable; set ADOBEPY_CLI to an official release binary",
             EXIT_ACQUIRE,
         )
+    if bridge_identity and bridge_identity["version"] != metadata["adobepy"]:
+        raise PreflightError(
+            "acquire",
+            "The adobepy CLI bundle version does not match the selected adobepy SDK",
+            EXIT_ACQUIRE,
+        )
     token = active_env.get("ADOBEPY_TOKEN")
-    if request.command in {"install", "upgrade", "verify"} and not token:
+    if request.command in {"install", "upgrade", "verify"} and (
+        not token or len(token) > 4_096 or "\0" in token
+    ):
         raise PreflightError(
             "authentication",
             "ADOBEPY_TOKEN must be configured in the installer environment",
         )
+    broker_url = active_env.get("ADOBEPY_BROKER_URL", "http://127.0.0.1:47391")
+    parsed_broker = urlparse(broker_url)
+    try:
+        broker_port = parsed_broker.port
+    except ValueError as exc:
+        raise PreflightError("broker", "ADOBEPY_BROKER_URL has an invalid port") from exc
+    if (
+        parsed_broker.scheme != "http"
+        or parsed_broker.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or broker_port is None
+        or parsed_broker.username is not None
+        or parsed_broker.password is not None
+        or parsed_broker.path not in {"", "/"}
+        or parsed_broker.query
+        or parsed_broker.fragment
+    ):
+        raise PreflightError(
+            "broker", "ADOBEPY_BROKER_URL must be an uncredentialed loopback HTTP origin"
+        )
+    target = active_env.get("ADOBEPY_TARGET", "default")
+    if _TARGET.fullmatch(target) is None:
+        raise PreflightError("target", "ADOBEPY_TARGET must be a bounded canonical identifier")
     return ResolvedInstall(
         host_path=host_path,
         host_version=host_version,
@@ -241,8 +643,10 @@ def resolve_install(
         bootstrap_error_path=(state_dir / "bootstrap-errors.json").resolve(),
         adobepy_cli=bridge_cli,
         token=token,
-        broker_url=active_env.get("ADOBEPY_BROKER_URL"),
-        target=active_env.get("ADOBEPY_TARGET", "default"),
+        broker_url=broker_url,
+        target=target,
+        python_modules=modules,
+        bridge_identity=bridge_identity or {},
     )
 
 
