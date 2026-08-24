@@ -68,13 +68,7 @@ def launch_host_command(resolved: ResolvedInstall) -> list[str]:
 
 def _acquire_adobepy_steps(request: InstallRequest, reason: str) -> list[dict[str, Any]]:
     if sys.platform != "win32":
-        return [
-            next_step(
-                ["gh", "issue", "view", "65", "--repo", "dcc-mcp/adobepy"],
-                reason,
-                "inspect-supported-cli-dependency",
-            )
-        ]
+        return []
     script = (
         "$ErrorActionPreference='Stop';"
         "$root=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "

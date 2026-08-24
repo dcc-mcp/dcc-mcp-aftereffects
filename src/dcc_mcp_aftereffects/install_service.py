@@ -129,6 +129,7 @@ def _install_or_upgrade(
     try:
         run_adobepy_install_bridge(
             cli=resolved.adobepy_cli,
+            expected_identity=resolved.bridge_identity,
             destination=staged,
             token=resolved.token,
             broker_url=resolved.broker_url,

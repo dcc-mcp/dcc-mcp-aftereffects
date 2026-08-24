@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -51,8 +52,24 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
     host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
     host.parent.mkdir(parents=True)
     host.write_bytes(b"host")
-    bridge_cli = tmp_path / "adobepy.exe"
+    bridge_bundle = tmp_path / "adobepy-0.6.2-windows-x64"
+    bridge_cli = bridge_bundle / "bin" / "adobepy.exe"
+    bridge_cli.parent.mkdir(parents=True)
     bridge_cli.write_bytes(b"cli")
+    bridge_manifest = bridge_bundle / "package-manifest.json"
+    bridge_manifest.write_text(
+        json.dumps(
+            {
+                "name": "adobepy",
+                "version": "0.6.2",
+                "runtime": "windows-x64",
+                "includes": ["bin/adobepy.exe"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli_bytes = bridge_cli.read_bytes()
+    manifest_bytes = bridge_manifest.read_bytes()
     return ResolvedInstall(
         host_path=host,
         host_version="24.6",
@@ -66,6 +83,17 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
         token=secret,
         broker_url="http://127.0.0.1:47391",
         target="default",
+        bridge_identity={
+            "executable": str(bridge_cli.resolve()),
+            "version": "0.6.2",
+            "runtime": "windows-x64",
+            "bytes": len(cli_bytes),
+            "sha256": hashlib.sha256(cli_bytes).hexdigest(),
+            "manifest_path": str(bridge_manifest.resolve()),
+            "manifest_bytes": len(manifest_bytes),
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "provenance": "official_checksum_release",
+        },
     )
 
 
@@ -207,6 +235,9 @@ def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path)
     assert uninstall_report["status"] == "ok"
     assert not resolved.extension_path.exists()
     assert not resolved.receipt_path.exists()
+    assert not list(
+        resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.recovery-*")
+    )
 
     command, kwargs = runner.calls[0]
     assert "--token" not in command

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from jsonschema import Draft202012Validator
 from test_install_lifecycle import BridgeRunner, healthy_dependencies, resolved_install
 
 import dcc_mcp_aftereffects.install_discovery as install_discovery
+import dcc_mcp_aftereffects.install_io as install_io
 import dcc_mcp_aftereffects.install_reporting as install_reporting
 from dcc_mcp_aftereffects.config import AfterEffectsConfig
 from dcc_mcp_aftereffects.install_contract import (
@@ -34,6 +36,7 @@ from dcc_mcp_aftereffects.install_io import file_manifest
 from dcc_mcp_aftereffects.install_models import InstallRequest
 from dcc_mcp_aftereffects.install_reporting import build_preflight_report
 from dcc_mcp_aftereffects.install_service import run_lifecycle
+from dcc_mcp_aftereffects.install_verification import _validate_runtime_identity
 from dcc_mcp_aftereffects.runtime import AfterEffectsStatus
 
 SCHEMA_SHA256 = "3ca25788439917b4d4c0617230a762f9797756b5b54f45c8c4149f975b90f904"
@@ -221,6 +224,72 @@ def test_uninstall_receipt_failure_restores_exact_install(
     assert file_manifest(resolved.extension_path) == manifest_before
 
 
+def test_uninstall_recovery_cleanup_failure_preserves_an_exact_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    _, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK
+    receipt_before = resolved.receipt_path.read_bytes()
+    manifest_before = file_manifest(resolved.extension_path)
+    original_safe_remove = install_io.safe_remove_tree
+    original_unlink = Path.unlink
+    injected = False
+
+    def partial_directory_cleanup(path: Path):
+        nonlocal injected
+        if (
+            not injected
+            and ".recovery-" in path.name
+            and ".recovery-check-" not in path.name
+            and path.is_dir()
+        ):
+            injected = True
+            victim = next(item for item in path.rglob("*") if item.is_file())
+            victim.unlink()
+            return {"success": False, "errors": ["simulated partial cleanup"]}
+        return original_safe_remove(path)
+
+    def fail_atomic_recovery_unlink(path: Path, *args, **kwargs):
+        nonlocal injected
+        if not injected and ".recovery-" in path.name and path.suffix == ".zip":
+            injected = True
+            raise PermissionError("simulated atomic recovery cleanup lock")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(install_io, "safe_remove_tree", partial_directory_cleanup)
+    monkeypatch.setattr(Path, "unlink", fail_atomic_recovery_unlink)
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("uninstall", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert injected is True
+    assert exit_code != EXIT_OK
+    assert report["status"] in {"failed", "requires_restart"}
+    assert resolved.receipt_path.read_bytes() == receipt_before
+    assert file_manifest(resolved.extension_path) == manifest_before
+    recovery_archives = list(
+        resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.recovery-*.zip")
+    )
+    assert len(recovery_archives) == 1
+    assert zipfile.is_zipfile(recovery_archives[0])
+    assert not [
+        path
+        for path in resolved.extension_path.parent.glob(
+            f".{resolved.extension_path.name}.recovery-*"
+        )
+        if path.is_dir()
+    ]
+
+
 @pytest.mark.parametrize(
     "value",
     ["24.0rc1", "24.0+local", " 24.0", "24.0 ", "024.0", "24..0", "9" * 80],
@@ -332,11 +401,16 @@ def _resolve_public_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cli = _release_cli(tmp_path)
     version = importlib.metadata.version("adobepy")
     cli_sha256 = hashlib.sha256(cli.read_bytes()).hexdigest()
+    manifest = cli.parent.parent / "package-manifest.json"
+    manifest_bytes = manifest.read_bytes()
     monkeypatch.setitem(
         install_discovery._PUBLISHED_ADOBEPY_RELEASES,
         (version, "windows-x64"),
         {
             "cli_sha256": cli_sha256,
+            "cli_bytes": str(cli.stat().st_size),
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "manifest_bytes": str(len(manifest_bytes)),
             "archive_sha256": "a" * 64,
             "release_tag": f"adobepy-v{version}",
             "asset": f"adobepy-{version}-windows-x64.zip",
@@ -574,6 +648,69 @@ def test_retry_command_preserves_exact_selected_context(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("replaced", ["cli", "manifest"])
+def test_bridge_cli_is_rehashed_immediately_before_external_execution(
+    tmp_path: Path, replaced: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    runner = BridgeRunner()
+    selected = (
+        resolved.adobepy_cli
+        if replaced == "cli"
+        else Path(resolved.bridge_identity["manifest_path"])
+    )
+    selected.write_bytes(b"replaced-after-preflight")
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_INSTALL
+    assert report["verify"]["failure_stage"] == "install"
+    assert runner.calls == []
+
+
+def test_macos_bundle_identity_binds_the_inner_after_effects_process(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    bundle = tmp_path / "Adobe After Effects 2025.app"
+    executable = bundle / "Contents" / "MacOS" / "After Effects"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"mach-o-test-double")
+    resolved = __import__("dataclasses").replace(resolved, host_path=bundle)
+    resolved.extension_path.mkdir(parents=True)
+    (resolved.extension_path / "manifest.xml").write_text("<ExtensionManifest />", encoding="utf-8")
+    dependencies = healthy_dependencies(BridgeRunner())
+    status = dependencies.readiness_probe(resolved)
+    identity = dict(status.identity or {})
+    identity["process_executable"] = str(executable)
+    status = AfterEffectsStatus(
+        True,
+        version=resolved.host_version,
+        target=resolved.target,
+        identity=identity,
+    )
+
+    def process_probe(pid: int):
+        if pid == identity["host_pid"]:
+            return {
+                "ok": True,
+                "executable": str(executable),
+                "process_start_identity": identity["process_start_identity"],
+            }
+        broker = identity["broker"]
+        return {
+            "ok": True,
+            "executable": broker["executable"],
+            "process_start_identity": broker["process_start_identity"],
+        }
+
+    valid, stage, _reason, error_type = _validate_runtime_identity(status, resolved, process_probe)
+
+    assert (valid, stage, error_type) == (True, None, None)
+
+
 def test_acquire_failure_has_pinned_executable_windows_remediation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -613,3 +750,17 @@ def test_acquire_failure_has_pinned_executable_windows_remediation(
         "C:/Python/python.exe",
         "--yes",
     ]
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_non_windows_acquire_failure_has_no_dead_end_issue_view_remediation(
+    monkeypatch: pytest.MonkeyPatch, platform_name: str
+) -> None:
+    monkeypatch.setattr(install_reporting.sys, "platform", platform_name)
+    report = build_preflight_report(
+        InstallRequest("install", as_json=True, yes=True),
+        PreflightError("acquire", "supported CLI unavailable", 20),
+    )
+
+    _validator().validate(report)
+    assert report["next_steps"] == []

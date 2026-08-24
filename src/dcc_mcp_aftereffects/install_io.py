@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,8 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from dcc_mcp_core.install_lifecycle import inspect_install_root, safe_remove_tree
+
+from .install_discovery import reattest_bridge_cli
 
 
 class InstallIoError(RuntimeError):
@@ -208,12 +211,15 @@ def capture_bootstrap_errors(path: Path, stage: str, secret: str | None = None) 
 def run_adobepy_install_bridge(
     *,
     cli: Path,
+    expected_identity: Mapping[str, Any],
     destination: Path,
     token: str,
     broker_url: str | None,
     target: str,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
+    if not reattest_bridge_cli(cli, expected_identity):
+        raise InstallIoError("The audited adobepy CLI identity changed before execution")
     if broker_url:
         parsed_broker = urlparse(broker_url)
         try:
@@ -443,6 +449,110 @@ def commit_staged_install(
     return transaction
 
 
+def _write_recovery_archive(
+    source: Path,
+    receipt: Mapping[str, Any],
+    archive_path: Path,
+) -> None:
+    entries = receipt.get("files")
+    if not isinstance(entries, list) or not receipt_files_match(receipt, source):
+        raise OSError("After Effects recovery source does not match its receipt")
+    temporary = archive_path.with_name(f".{archive_path.name}.{uuid4().hex}.tmp")
+    try:
+        with zipfile.ZipFile(temporary, mode="x", compression=zipfile.ZIP_STORED) as archive:
+            for entry in entries:
+                relative = _safe_relative(entry.get("path")) if isinstance(entry, dict) else None
+                if relative is None:
+                    raise OSError("After Effects recovery receipt contains an unsafe path")
+                source_path = source / relative
+                entry_type = entry.get("type")
+                if entry_type == "directory":
+                    contents = b""
+                elif entry_type == "symlink":
+                    contents = os.fsencode(os.readlink(source_path))
+                elif entry_type == "file":
+                    contents = source_path.read_bytes()
+                else:
+                    raise OSError("After Effects recovery receipt contains an unsupported entry")
+                if len(contents) != entry.get("bytes") or _sha256(contents) != entry.get("sha256"):
+                    raise OSError("After Effects recovery source changed during snapshot")
+                archive.writestr(relative.as_posix(), contents)
+        _replace_with_retry(temporary, archive_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _restore_recovery_archive(
+    archive_path: Path,
+    destination: Path,
+    receipt: Mapping[str, Any],
+) -> None:
+    entries = receipt.get("files")
+    if not isinstance(entries, list):
+        raise OSError("After Effects recovery receipt is invalid")
+    expected = {
+        entry.get("path"): entry
+        for entry in entries
+        if isinstance(entry, dict) and _safe_relative(entry.get("path")) is not None
+    }
+    if len(expected) != len(entries):
+        raise OSError("After Effects recovery receipt contains duplicate or unsafe paths")
+    staging = destination.with_name(f".{destination.name}.restore-{uuid4().hex}")
+    try:
+        with zipfile.ZipFile(archive_path, mode="r") as archive:
+            members = archive.infolist()
+            if len(members) != len(expected) or {member.filename for member in members} != set(
+                expected
+            ):
+                raise OSError("After Effects recovery archive does not match its receipt")
+            for member in sorted(
+                members, key=lambda item: (len(PurePosixPath(item.filename).parts), item.filename)
+            ):
+                entry = expected[member.filename]
+                relative = _safe_relative(member.filename)
+                if relative is None or member.file_size != entry.get("bytes"):
+                    raise OSError("After Effects recovery archive contains an invalid entry")
+                contents = archive.read(member)
+                if len(contents) != entry.get("bytes") or _sha256(contents) != entry.get("sha256"):
+                    raise OSError("After Effects recovery archive entry failed validation")
+                output = staging / relative
+                output.parent.mkdir(parents=True, exist_ok=True)
+                if entry.get("type") == "directory":
+                    if contents:
+                        raise OSError("After Effects recovery directory entry is not empty")
+                    output.mkdir(exist_ok=True)
+                elif entry.get("type") == "symlink":
+                    target = os.fsdecode(contents)
+                    if not _safe_symlink_target(member.filename, target):
+                        raise OSError("After Effects recovery symlink target is unsafe")
+                    os.symlink(target, output)
+                elif entry.get("type") == "file":
+                    output.write_bytes(contents)
+                else:
+                    raise OSError("After Effects recovery archive contains an unsupported entry")
+        if not receipt_files_match(receipt, staging):
+            raise OSError(
+                "After Effects recovery archive did not restore the exact receipt closure"
+            )
+        _replace_with_retry(staging, destination)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        if staging.exists() or staging.is_symlink():
+            safe_remove_tree(staging)
+        raise OSError("After Effects recovery archive could not be restored") from exc
+
+
+def _validate_recovery_archive(
+    archive_path: Path,
+    destination: Path,
+    receipt: Mapping[str, Any],
+) -> None:
+    validation = destination.with_name(f".{destination.name}.recovery-check-{uuid4().hex}")
+    _restore_recovery_archive(archive_path, validation, receipt)
+    cleanup = safe_remove_tree(validation)
+    if not cleanup.get("success") or validation.exists():
+        raise OSError("After Effects recovery validation cleanup failed")
+
+
 def remove_receipted_install(destination: Path, receipt_path: Path) -> None:
     receipt = read_receipt(receipt_path)
     if receipt is None or not destination.is_dir() or not receipt_files_match(receipt, destination):
@@ -450,7 +560,7 @@ def remove_receipted_install(destination: Path, receipt_path: Path) -> None:
     inspection = inspect_install_root(destination)
     if inspection.get("requires_restart"):
         raise RestartRequired("After Effects holds the receipted extension open")
-    recovery = destination.with_name(f".{destination.name}.recovery-{uuid4().hex}")
+    recovery = destination.with_name(f".{destination.name}.recovery-{uuid4().hex}.zip")
     quarantine = destination.with_name(f".{destination.name}.uninstall-{uuid4().hex}")
     receipt_bytes = receipt_path.read_bytes()
 
@@ -462,8 +572,9 @@ def remove_receipted_install(destination: Path, receipt_path: Path) -> None:
 
     def restore() -> bool:
         try:
-            cleanup(destination)
-            shutil.copytree(recovery, destination, symlinks=True, copy_function=shutil.copy2)
+            if not cleanup(destination):
+                raise OSError("After Effects failed destination could not be quarantined")
+            _restore_recovery_archive(recovery, destination, receipt)
             _write_receipt_bytes(receipt_path, receipt_bytes)
             restored = read_receipt(receipt_path)
             if restored is None or not receipt_files_match(restored, destination):
@@ -471,14 +582,12 @@ def remove_receipted_install(destination: Path, receipt_path: Path) -> None:
         except OSError:
             return False
         cleanup(quarantine)
-        cleanup(recovery)
         return True
 
     moved = False
     try:
-        shutil.copytree(destination, recovery, symlinks=True, copy_function=shutil.copy2)
-        if not receipt_files_match(receipt, recovery):
-            raise OSError("After Effects uninstall recovery snapshot did not validate")
+        _write_recovery_archive(destination, receipt, recovery)
+        _validate_recovery_archive(recovery, destination, receipt)
         _replace_with_retry(destination, quarantine)
         moved = True
         if not cleanup(quarantine):
@@ -499,10 +608,14 @@ def remove_receipted_install(destination: Path, receipt_path: Path) -> None:
         if _locked_error(exc):
             raise RestartRequired("Uninstall was rolled back because files remain locked") from exc
         raise InstallIoError("Uninstall failed; the receipted extension was restored") from exc
-    if not cleanup(recovery):
+    try:
+        recovery.unlink()
+    except OSError as exc:
         if restore():
-            raise RestartRequired("Uninstall cleanup failed; the extension was restored")
-        raise RollbackError("Uninstall cleanup failed and recovery requires operator action")
+            raise RestartRequired("Uninstall cleanup failed; the extension was restored") from exc
+        raise RollbackError(
+            "Uninstall cleanup failed and recovery requires operator action"
+        ) from exc
 
 
 def remove_staging(path: Path) -> None:
