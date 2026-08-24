@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,8 @@ class ResolvedInstall:
     token: str | None = field(repr=False)
     broker_url: str | None = None
     target: str = "default"
+    python_modules: Mapping[str, Any] = field(default_factory=dict)
+    bridge_identity: Mapping[str, Any] = field(default_factory=dict)
 
 
 __all__ = ["InstallRequest", "ResolvedInstall"]

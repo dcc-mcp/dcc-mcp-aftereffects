@@ -78,17 +78,21 @@ class AfterEffectsStatus:
     reason: str = ""
     version: str | None = None
     target: str = "default"
+    identity: Mapping[str, Any] | None = None
+    error_type: str | None = None
 
 
 def _matching_session(payloads: list[Mapping[str, Any]], target: str) -> Mapping[str, Any] | None:
+    matches = []
     for payload in payloads:
         capabilities = payload.get("capabilities", {})
         if (
             capabilities.get("host") == "after-effects"
+            and capabilities.get("bridgeKind") == "cep"
             and payload.get("target", "default") == target
         ):
-            return payload
-    return None
+            matches.append(payload)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _missing_methods(capabilities: Mapping[str, Any]) -> list[str]:
@@ -119,8 +123,13 @@ def probe_aftereffects(
     )
     try:
         session = _matching_session(active_client.capabilities(), target)
-    except Exception as exc:  # noqa: BLE001 - readiness must remain queryable
-        return AfterEffectsStatus(False, str(exc), target=target)
+    except Exception:  # noqa: BLE001 - readiness must remain queryable
+        return AfterEffectsStatus(
+            False,
+            "adobepy broker capability probe failed",
+            target=target,
+            error_type="broker_probe_failed",
+        )
     if session is None:
         return AfterEffectsStatus(
             False,
@@ -140,10 +149,31 @@ def probe_aftereffects(
         return AfterEffectsStatus(False, "official DOM capability is unavailable", target=target)
 
     try:
-        version = str(app_factory(client=active_client).version)
-    except Exception as exc:  # noqa: BLE001 - readiness reports host failures
-        return AfterEffectsStatus(False, str(exc), target=target)
-    return AfterEffectsStatus(True, version=version, target=target)
+        app = app_factory(client=active_client)
+        version = str(app.version)
+        runtime_identity = getattr(app, "runtime_identity", None)
+        identity = runtime_identity() if callable(runtime_identity) else runtime_identity
+    except Exception:  # noqa: BLE001 - readiness reports stable host failures
+        return AfterEffectsStatus(
+            False,
+            "typed After Effects runtime probe failed",
+            target=target,
+            error_type="host_rpc_failed",
+        )
+    if not isinstance(identity, Mapping):
+        return AfterEffectsStatus(
+            False,
+            "adobepy did not attest the exact After Effects CEP runtime identity",
+            version=version,
+            target=target,
+            error_type="runtime_identity_unavailable",
+        )
+    return AfterEffectsStatus(
+        True,
+        version=version,
+        target=target,
+        identity=dict(identity),
+    )
 
 
 __all__ = ["AfterEffectsStatus", "REQUIRED_METHODS", "probe_aftereffects"]
