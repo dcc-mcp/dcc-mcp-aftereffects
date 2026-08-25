@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.6.0...v0.7.0) (2026-08-25)
+
+
+### Features
+
+* add After Effects install lifecycle ([ec34da3](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/ec34da38abbc3e28bd2a3f750dc136a54680c2cb))
+
+
+### Bug Fixes
+
+* attest Windows signature helper ([b54e648](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/b54e6481d439e54e6d5646610ce493092bc43f60))
+* close After Effects install trust gaps ([ff3c17a](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/ff3c17ae3327c27f906f30516aab070cff21c594))
+* harden After Effects install lifecycle ([05841c4](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/05841c4d65f667a4bc6d82ef4fae30c00aa770fc))
+* harden After Effects install recovery ([753cc53](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/753cc53ac0b2a24c2e99fa60fae3e53f22d9ad46))
+
 ## [0.6.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.5.0...v0.6.0) (2026-08-11)
 
 
