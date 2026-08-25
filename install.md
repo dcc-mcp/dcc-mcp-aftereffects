@@ -17,7 +17,7 @@ point and do not claim catalog installation is complete.
 - **Python:** 3.9 or newer for the adapter sidecar; this is not After Effects'
   embedded ExtendScript runtime.
 - **dcc-mcp-core:** 0.20.14 or newer in the selected Python environment.
-- **adobepy:** Python SDK 0.6.2 or newer plus a supported `adobepy` CLI binary.
+- **adobepy:** Python SDK 0.6.2 plus the matching audited `adobepy` CLI binary.
 - **Authentication:** one non-empty `ADOBEPY_TOKEN` shared by the broker and
   CEP bridge.
 - **Permissions:** write access to the current user's CEP extension and
@@ -42,11 +42,13 @@ arguments, reports, logs, receipts, or PR text.
 
 ## Supported versions
 
+Current adapter release: **0.7.0** <!-- x-release-please-version -->
+
 | Adapter | dcc-mcp-core | After Effects | Python | Platform |
 |---|---|---|---|---|
-| 0.6.x | >=0.20.14,<1 | >=24.0 | >=3.9 | Windows 10/11 x64 |
-| 0.6.x | >=0.20.14,<1 | >=24.0 | >=3.9 | macOS discovery only; no allowlisted CLI release yet |
-| 0.6.x | >=0.20.14,<1 | unavailable | >=3.9 | Linux package development only; no host install |
+| Current release | >=0.20.14,<1 | >=24.0 | >=3.9 | Windows 10/11 x64 |
+| Current release | >=0.20.14,<1 | >=24.0 | >=3.9 | macOS discovery only; no allowlisted CLI release yet |
+| Current release | >=0.20.14,<1 | unavailable | >=3.9 | Linux package development only; no host install |
 
 Default host and profile paths are:
 

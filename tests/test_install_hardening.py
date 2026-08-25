@@ -563,7 +563,7 @@ def test_public_preflight_binds_host_python_core_schema_and_cli_provenance(
     assert resolved.host_version == "24.0"
     assert set(resolved.python_modules) == {"adapter", "core", "adobepy"}
     assert all(module["owned"] is True for module in resolved.python_modules.values())
-    assert resolved.core_version == "0.20.14"
+    assert resolved.core_version == importlib.metadata.version("dcc-mcp-core")
     assert resolved.bridge_identity["executable"] == str(resolved.adobepy_cli)
     assert len(resolved.bridge_identity["sha256"]) == 64
     assert resolved.target == "ae-test"
