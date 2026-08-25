@@ -30,11 +30,13 @@ use the official `adobepy-v0.6.2` release asset
 and the extracted `bin/adobepy.exe` SHA-256
 `c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa`.
 Set `ADOBEPY_CLI` to that executable. An optional `ADOBEPY_CLI_SHA256` must equal
-the pinned executable digest; it cannot introduce a new trust root. The signed
-release map plus the bounded bundle manifest binds the immutable release tag,
-asset, runtime, version, layout, and executable. An adjacent manifest alone is
-not trust. No macOS CLI release is currently allowlisted, so install and upgrade
-there fail closed with exit `20`; the adapter never copies an unverified bridge.
+the pinned executable digest; it cannot introduce a new trust root. The
+package-owned digest map binds the selected versioned asset, bounded manifest,
+and CLI bytes to fixed SHA-256, byte size, and layout. Remediation verifies each
+bound value and fails closed after download before installing mismatched bytes.
+An adjacent manifest alone is not trust. No macOS CLI release is currently
+allowlisted, so install and upgrade there fail closed with exit `20`; the adapter
+never copies an unverified bridge.
 
 Keep the token in the process environment. The adapter passes it to the
 supported CLI through `ADOBEPY_TOKEN`; it never places the token in command
