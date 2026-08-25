@@ -56,7 +56,8 @@ jobs:
         with:
           name: release-distributions
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+      - name: Publish release distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
 
   attach-release-artifacts:
     needs: [release-please, build-release-artifacts]
