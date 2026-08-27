@@ -390,7 +390,6 @@ def prepare_install_directories(
             "device": int(details.st_dev),
             "inode": int(details.st_ino),
             "mode": int(details.st_mode),
-            "links": int(details.st_nlink),
         }
 
     def require_created_identities() -> None:

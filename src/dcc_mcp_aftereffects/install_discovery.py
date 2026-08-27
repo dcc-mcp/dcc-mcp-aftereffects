@@ -804,7 +804,6 @@ def _mutation_target_identity(path: Path) -> dict[str, Any]:
                     "device": int(details.st_dev),
                     "inode": int(details.st_ino),
                     "mode": int(details.st_mode),
-                    "links": int(details.st_nlink),
                 },
             }
         )
