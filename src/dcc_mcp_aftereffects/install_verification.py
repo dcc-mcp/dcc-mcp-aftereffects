@@ -219,7 +219,8 @@ def installation_state(resolved: ResolvedInstall) -> tuple[str, dict[str, Any] |
     receipt = read_receipt(resolved.receipt_path)
     exists = resolved.extension_path.is_dir()
     if receipt is None:
-        return ("partial" if exists else "fresh"), None
+        receipt_exists = resolved.receipt_path.exists() or resolved.receipt_path.is_symlink()
+        return ("partial" if exists or receipt_exists else "fresh"), None
     if not exists:
         return "partial", receipt
     if (
@@ -238,10 +239,6 @@ def installation_state(resolved: ResolvedInstall) -> tuple[str, dict[str, Any] |
         or receipt.get("python_version") != resolved.python_version
         or receipt.get("target") != resolved.target
         or receipt.get("broker_url") != resolved.broker_url
-        or (
-            bool(resolved.python_modules)
-            and receipt.get("python_modules") != dict(resolved.python_modules)
-        )
         or (
             bool(resolved.bridge_identity)
             and receipt.get("bridge") != dict(resolved.bridge_identity)

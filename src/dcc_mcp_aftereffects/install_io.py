@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -360,13 +361,178 @@ def run_adobepy_install_bridge(
     }
 
 
-def create_staging_dir(destination: Path) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent))
+def prepare_install_directories(
+    paths: tuple[Path, ...],
+    *,
+    before_mutation: Callable[[], None],
+    identity_paths: tuple[Path, ...],
+    capture_after: Callable[[], Any],
+) -> Any:
+    """Create missing mutation ancestors one level at a time under the identity lease."""
+    created: dict[str, dict[str, int]] = {}
+
+    def directory_identity(path: Path) -> dict[str, int]:
+        details = path.lstat()
+        if stat.S_ISLNK(details.st_mode) or bool(
+            getattr(details, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise IdentityAttestationError(
+                "A mutation-root ancestor crossed a link or reparse boundary",
+                stage="mutation_roots",
+            )
+        if not stat.S_ISDIR(details.st_mode):
+            raise IdentityAttestationError(
+                "A mutation-root ancestor is not a directory",
+                stage="mutation_roots",
+            )
+        return {
+            "device": int(details.st_dev),
+            "inode": int(details.st_ino),
+            "mode": int(details.st_mode),
+            "links": int(details.st_nlink),
+        }
+
+    def require_created_identities() -> None:
+        if any(directory_identity(Path(path)) != expected for path, expected in created.items()):
+            raise IdentityAttestationError(
+                "A newly created mutation-root ancestor changed identity",
+                stage="mutation_roots",
+            )
+
+    with ExitStack() as leases:
+        leases.enter_context(_hold_identity_paths(identity_paths))
+        before_mutation()
+        for target in paths:
+            parent = Path(os.path.abspath(target)).parent
+            current = Path(parent.anchor)
+            for part in parent.parts[1:]:
+                current /= part
+                if current.exists() or current.is_symlink():
+                    require_created_identities()
+                    before_mutation()
+                    continue
+                if os.name == "nt":
+                    provisional = Path(
+                        tempfile.mkdtemp(prefix=f".{current.name}.create-", dir=current.parent)
+                    )
+                    expected = directory_identity(provisional)
+                    try:
+                        require_created_identities()
+                        before_mutation()
+                        os.rename(provisional, current)
+                    except OSError:
+                        require_created_identities()
+                        before_mutation()
+                        raise IdentityAttestationError(
+                            "A mutation-root ancestor appeared inside the creation boundary",
+                            stage="mutation_roots",
+                        ) from None
+                    finally:
+                        if provisional.exists():
+                            safe_remove_tree(provisional)
+                else:
+                    try:
+                        current.mkdir()
+                    except FileExistsError:
+                        before_mutation()
+                        raise IdentityAttestationError(
+                            "A mutation-root ancestor appeared inside the creation boundary",
+                            stage="mutation_roots",
+                        ) from None
+                    expected = directory_identity(current)
+                leases.enter_context(_hold_identity_paths((current,)))
+                if directory_identity(current) != expected:
+                    raise IdentityAttestationError(
+                        "A newly created mutation-root ancestor changed identity",
+                        stage="mutation_roots",
+                    )
+                created[os.path.normcase(str(current.absolute()))] = expected
+                require_created_identities()
+                before_mutation()
+        require_created_identities()
+        before_mutation()
+        captured = capture_after()
+        require_created_identities()
+        return captured
+
+
+def create_staging_dir(
+    destination: Path,
+    *,
+    before_mutation: Callable[[], None] | None = None,
+    identity_paths: tuple[Path, ...] = (),
+) -> Path:
+    with _hold_identity_paths(identity_paths):
+        if before_mutation is not None:
+            before_mutation()
+        return Path(tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent))
 
 
 def _locked_error(exc: OSError) -> bool:
     return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33}
+
+
+@contextmanager
+def _hold_identity_paths(paths: tuple[Path, ...]) -> Iterator[None]:
+    """Keep exact attested Windows objects non-replaceable through one mutation."""
+    handles: list[Any] = []
+    locked = {os.path.normcase(str(Path(path).absolute())) for path in paths}
+    try:
+        if os.name == "nt":
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            invalid = wintypes.HANDLE(-1).value
+            for path in paths:
+                flags = 0x02000000 if path.is_dir() else 0
+                handle = kernel32.CreateFileW(
+                    str(path),
+                    0x80,
+                    0x3 if path.is_dir() else 0x1,
+                    None,
+                    3,
+                    flags,
+                    None,
+                )
+                if handle == invalid:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                handles.append((kernel32, handle))
+        else:
+            for path in paths:
+                handles.append(os.open(path, os.O_RDONLY))
+        yield
+    except OSError as exc:
+        error_paths = {
+            os.path.normcase(str(Path(value).absolute()))
+            for value in (getattr(exc, "filename", None), getattr(exc, "filename2", None))
+            if value
+        }
+        if error_paths & locked:
+            raise IdentityAttestationError(
+                "An attested install identity changed inside the mutation boundary",
+                stage="identity_attestation",
+            ) from exc
+        raise
+    finally:
+        for handle in reversed(handles):
+            if os.name == "nt":
+                kernel32, native = handle
+                kernel32.CloseHandle(native)
+            else:
+                os.close(handle)
 
 
 def _replace_with_retry(
@@ -374,12 +540,14 @@ def _replace_with_retry(
     destination: Path,
     *,
     before_mutation: Callable[[], None] | None = None,
+    identity_paths: tuple[Path, ...] = (),
 ) -> None:
     for attempt in range(3):
         try:
-            if before_mutation is not None:
-                before_mutation()
-            os.replace(source, destination)
+            with _hold_identity_paths(identity_paths):
+                if before_mutation is not None:
+                    before_mutation()
+                os.replace(source, destination)
             return
         except OSError:
             if attempt == 2:
@@ -410,6 +578,42 @@ class InstallTransaction:
     committed_new: bool = False
     closed: bool = False
     recovery_archive: Path | None = None
+    identity_attestor: Callable[[], bool] | None = None
+    identity_paths: tuple[Path, ...] = ()
+    mutation_root_attestor: Callable[[], bool] | None = None
+    mutation_root_paths: tuple[Path, ...] = ()
+
+    @staticmethod
+    def _require_attestation(
+        attestor: Callable[[], bool] | None,
+        *,
+        stage: str,
+        message: str,
+    ) -> None:
+        if attestor is None:
+            return
+        try:
+            verified = attestor()
+        except IdentityAttestationError:
+            raise
+        except BaseException as exc:
+            raise IdentityAttestationError(message, stage=stage) from exc
+        if verified is not True:
+            raise IdentityAttestationError(message, stage=stage)
+
+    def _require_identity(self) -> None:
+        self._require_attestation(
+            self.identity_attestor,
+            stage="identity_attestation",
+            message="The install identities could not be recaptured exactly",
+        )
+
+    def _require_mutation_roots(self) -> None:
+        self._require_attestation(
+            self.mutation_root_attestor,
+            stage="mutation_roots",
+            message="The extension or receipt mutation roots could not be recaptured exactly",
+        )
 
     def _prior_receipt(self) -> dict[str, Any] | None:
         if self.old_receipt is None or not self.old_receipt_valid:
@@ -423,87 +627,127 @@ class InstallTransaction:
     def rollback(self) -> None:
         if self.closed:
             return
-        failed = self.destination.with_name(f".{self.destination.name}.failed-{uuid4().hex}")
-        try:
-            if self.committed_new and self.destination.exists():
-                _replace_with_retry(self.destination, failed)
-            if self.moved_existing:
-                prior_receipt = self._prior_receipt()
-                if prior_receipt is not None and receipt_files_match(prior_receipt, self.backup):
-                    _replace_with_retry(self.backup, self.destination)
-                elif self.recovery_archive is not None and prior_receipt is not None:
-                    _restore_recovery_archive(
-                        self.recovery_archive,
-                        self.destination,
-                        prior_receipt,
-                    )
-                else:
-                    raise OSError("previous After Effects extension backup is unavailable")
-            if self.moved_receipt:
-                if self.receipt_backup is None or not self.receipt_backup.exists():
-                    raise OSError("previous After Effects receipt backup is unavailable")
-                _replace_with_retry(self.receipt_backup, self.receipt_path)
-            elif self.old_receipt is None:
-                self.receipt_path.unlink(missing_ok=True)
-            if self.old_receipt_valid:
-                restored = read_receipt(self.receipt_path)
-                if restored is None or not receipt_files_match(restored, self.destination):
-                    raise OSError("previous After Effects extension rollback did not validate")
-            self.closed = True
-        finally:
-            if failed.exists():
-                safe_remove_tree(failed)
-            if self.closed and self.backup.exists():
-                safe_remove_tree(self.backup)
-            if self.closed and self.recovery_archive is not None:
-                try:
-                    self.recovery_archive.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            if self.closed and self.receipt_backup is not None:
-                self.receipt_backup.unlink(missing_ok=True)
+        with _hold_identity_paths(self.mutation_root_paths):
+            self._require_mutation_roots()
+            failed = self.destination.with_name(f".{self.destination.name}.failed-{uuid4().hex}")
+            try:
+                if self.committed_new and self.destination.exists():
+                    self._require_mutation_roots()
+                    _replace_with_retry(self.destination, failed)
+                if self.moved_existing:
+                    prior_receipt = self._prior_receipt()
+                    self._require_mutation_roots()
+                    if prior_receipt is not None and receipt_files_match(
+                        prior_receipt, self.backup
+                    ):
+                        _replace_with_retry(self.backup, self.destination)
+                    elif self.recovery_archive is not None and prior_receipt is not None:
+                        _restore_recovery_archive(
+                            self.recovery_archive,
+                            self.destination,
+                            prior_receipt,
+                        )
+                    else:
+                        raise OSError("previous After Effects extension backup is unavailable")
+                if self.moved_receipt:
+                    self._require_mutation_roots()
+                    if self.receipt_backup is not None and self.receipt_backup.exists():
+                        _replace_with_retry(self.receipt_backup, self.receipt_path)
+                    elif self.old_receipt is not None:
+                        _write_receipt_bytes(self.receipt_path, self.old_receipt)
+                    else:
+                        raise OSError("previous After Effects receipt backup is unavailable")
+                elif self.old_receipt is None:
+                    self._require_mutation_roots()
+                    self.receipt_path.unlink(missing_ok=True)
+                if self.old_receipt_valid:
+                    restored = read_receipt(self.receipt_path)
+                    if restored is None or not receipt_files_match(restored, self.destination):
+                        raise OSError("previous After Effects extension rollback did not validate")
+                self.closed = True
+            finally:
+                if failed.exists():
+                    self._require_mutation_roots()
+                    safe_remove_tree(failed)
+                if self.closed and self.backup.exists():
+                    self._require_mutation_roots()
+                    safe_remove_tree(self.backup)
+                if self.closed and self.recovery_archive is not None:
+                    try:
+                        self._require_mutation_roots()
+                        self.recovery_archive.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if self.closed and self.receipt_backup is not None:
+                    self._require_mutation_roots()
+                    self.receipt_backup.unlink(missing_ok=True)
 
     def finalize(self) -> None:
         if self.closed:
             return
-        if self.backup.exists():
-            prior_receipt = self._prior_receipt()
-            if prior_receipt is None or not receipt_files_match(prior_receipt, self.backup):
-                raise RestartRequired(
-                    "The previous extension backup could not be captured for safe cleanup"
+        with _hold_identity_paths(self.identity_paths):
+            self._require_identity()
+            if self.backup.exists():
+                prior_receipt = self._prior_receipt()
+                if prior_receipt is None or not receipt_files_match(prior_receipt, self.backup):
+                    raise RestartRequired(
+                        "The previous extension backup could not be captured for safe cleanup"
+                    )
+                recovery_archive = self.backup.with_name(
+                    f".{self.backup.name}.recovery-{uuid4().hex}.zip"
                 )
-            recovery_archive = self.backup.with_name(
-                f".{self.backup.name}.recovery-{uuid4().hex}.zip"
-            )
-            try:
-                _write_recovery_archive(self.backup, prior_receipt, recovery_archive)
-                _validate_recovery_archive(recovery_archive, self.backup, prior_receipt)
-            except OSError as exc:
-                recovery_archive.unlink(missing_ok=True)
-                raise RestartRequired(
-                    "The previous extension backup could not be captured for safe cleanup"
-                ) from exc
-            self.recovery_archive = recovery_archive
-            cleanup = safe_remove_tree(self.backup)
-            if not cleanup.get("success"):
-                raise RestartRequired(
-                    "The verified previous extension backup is locked until After Effects restarts"
-                )
-            try:
-                recovery_archive.unlink()
-            except OSError as exc:
-                raise RestartRequired(
-                    "The previous extension recovery snapshot could not be cleaned safely"
-                ) from exc
+                try:
+                    self._require_identity()
+                    _write_recovery_archive(self.backup, prior_receipt, recovery_archive)
+                    _validate_recovery_archive(recovery_archive, self.backup, prior_receipt)
+                except BaseException as exc:
+                    try:
+                        recovery_archive.unlink(missing_ok=True)
+                    except BaseException:
+                        pass
+                    if isinstance(exc, IdentityAttestationError):
+                        raise
+                    raise RestartRequired(
+                        "The previous extension backup could not be captured for safe cleanup"
+                    ) from exc
+                self.recovery_archive = recovery_archive
+                try:
+                    self._require_identity()
+                    cleanup = safe_remove_tree(self.backup)
+                except IdentityAttestationError:
+                    raise
+                except BaseException as exc:
+                    raise RestartRequired(
+                        "The verified previous extension backup could not be cleaned safely"
+                    ) from exc
+                if not cleanup.get("success"):
+                    raise RestartRequired(
+                        "The verified previous extension backup is locked until After Effects "
+                        "restarts"
+                    )
+            if self.receipt_backup is not None and self.receipt_backup.exists():
+                try:
+                    self._require_identity()
+                    self.receipt_backup.unlink()
+                except IdentityAttestationError:
+                    raise
+                except BaseException as exc:
+                    raise RestartRequired(
+                        "The previous receipt transaction snapshot could not be cleaned safely"
+                    ) from exc
+            if self.recovery_archive is not None and self.recovery_archive.exists():
+                try:
+                    self._require_identity()
+                    self.recovery_archive.unlink()
+                except IdentityAttestationError:
+                    raise
+                except BaseException as exc:
+                    raise RestartRequired(
+                        "The previous extension recovery snapshot could not be cleaned safely"
+                    ) from exc
+            self.receipt_backup = None
             self.recovery_archive = None
-        if self.receipt_backup is not None and self.receipt_backup.exists():
-            try:
-                self.receipt_backup.unlink()
-            except OSError as exc:
-                raise RestartRequired(
-                    "The previous receipt transaction snapshot could not be cleaned safely"
-                ) from exc
-        self.closed = True
+            self.closed = True
 
 
 def commit_staged_install(
@@ -514,6 +758,9 @@ def commit_staged_install(
     receipt_path: Path,
     receipt_writer: Callable[[Path, Mapping[str, Any]], None] = write_receipt,
     identity_attestor: Callable[[], bool] | None = None,
+    identity_paths: tuple[Path, ...] = (),
+    mutation_root_attestor: Callable[[], bool] | None = None,
+    mutation_root_paths: tuple[Path, ...] = (),
 ) -> InstallTransaction:
     inspection = inspect_install_root(destination)
     if inspection.get("requires_restart"):
@@ -538,6 +785,10 @@ def commit_staged_install(
             and receipt_files_match(old_payload, destination)
         ),
         receipt_backup=receipt_backup if old_receipt is not None else None,
+        identity_attestor=identity_attestor,
+        identity_paths=identity_paths,
+        mutation_root_attestor=mutation_root_attestor,
+        mutation_root_paths=mutation_root_paths,
     )
 
     def require_identity() -> None:
@@ -560,23 +811,37 @@ def commit_staged_install(
     try:
         require_identity()
         if destination.exists():
-            _replace_with_retry(destination, backup, before_mutation=require_identity)
+            _replace_with_retry(
+                destination,
+                backup,
+                before_mutation=require_identity,
+                identity_paths=identity_paths,
+            )
             transaction.moved_existing = True
         if transaction.receipt_backup is not None:
             _replace_with_retry(
                 receipt_path,
                 transaction.receipt_backup,
                 before_mutation=require_identity,
+                identity_paths=identity_paths,
             )
             transaction.moved_receipt = True
-        _replace_with_retry(staged, destination, before_mutation=require_identity)
+        _replace_with_retry(
+            staged,
+            destination,
+            before_mutation=require_identity,
+            identity_paths=identity_paths,
+        )
         transaction.committed_new = True
         receipt["receipt_version"] = 1
         receipt["files"] = file_manifest(destination)
         receipt["manifest_sha256"] = _manifest_digest(receipt["files"])
-        require_identity()
         try:
-            receipt_writer(receipt_path, receipt)
+            with _hold_identity_paths(identity_paths):
+                require_identity()
+                receipt_writer(receipt_path, receipt)
+        except IdentityAttestationError:
+            raise
         except BaseException as exc:
             callback_error = ReceiptCallbackError(
                 "The receipt callback failed after install mutation"
@@ -717,7 +982,20 @@ def _validate_recovery_archive(
         raise OSError("After Effects recovery validation cleanup failed")
 
 
-def remove_receipted_install(destination: Path, receipt_path: Path) -> None:
+def remove_receipted_install(
+    destination: Path,
+    receipt_path: Path,
+    *,
+    before_mutation: Callable[[], None] | None = None,
+    identity_paths: tuple[Path, ...] = (),
+) -> None:
+    with _hold_identity_paths(identity_paths):
+        if before_mutation is not None:
+            before_mutation()
+        _remove_receipted_install(destination, receipt_path)
+
+
+def _remove_receipted_install(destination: Path, receipt_path: Path) -> None:
     receipt = read_receipt(receipt_path)
     if receipt is None or not destination.is_dir() or not receipt_files_match(receipt, destination):
         raise InstallIoError("A complete matching After Effects receipt is required for uninstall")
@@ -796,6 +1074,7 @@ __all__ = [
     "create_staging_dir",
     "file_manifest",
     "read_receipt",
+    "prepare_install_directories",
     "remove_receipted_install",
     "remove_staging",
     "run_adobepy_install_bridge",

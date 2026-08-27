@@ -775,6 +775,50 @@ def _plain_directory_identity(path: Path) -> dict[str, Any]:
     return {"path": str(path), "physical": _physical_identity(details)}
 
 
+def _mutation_target_identity(path: Path) -> dict[str, Any]:
+    target = Path(os.path.abspath(path))
+    parent = target.parent
+    current = Path(parent.anchor)
+    ancestors: list[dict[str, Any]] = []
+    for part in parent.parts[1:]:
+        current /= part
+        try:
+            details = current.lstat()
+        except FileNotFoundError:
+            ancestors.append({"path": str(current), "state": "missing"})
+            continue
+        except OSError as exc:
+            raise ValueError("mutation-root ancestor identity is unavailable") from exc
+        if stat.S_ISLNK(details.st_mode) or bool(
+            getattr(details, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise ValueError("mutation-root ancestor crosses a link or reparse boundary")
+        if not stat.S_ISDIR(details.st_mode):
+            raise ValueError("mutation-root ancestor is not a directory")
+        ancestors.append(
+            {
+                "path": str(current),
+                "state": "directory",
+                "physical": {
+                    "device": int(details.st_dev),
+                    "inode": int(details.st_ino),
+                    "mode": int(details.st_mode),
+                    "links": int(details.st_nlink),
+                },
+            }
+        )
+    return {"target": str(target), "ancestors": ancestors}
+
+
+def capture_mutation_roots(extension_path: Path, receipt_path: Path) -> dict[str, Any]:
+    """Capture exact existing ancestors and absence for both install mutation roots."""
+    return {
+        "extension": _mutation_target_identity(extension_path),
+        "receipt": _mutation_target_identity(receipt_path),
+    }
+
+
 def _plain_file_identity(path: Path, maximum: int, *, allow_empty: bool = False) -> dict[str, Any]:
     path = Path(os.path.abspath(path))
     if _path_uses_link(path):
@@ -1684,14 +1728,22 @@ def resolve_install(
     target = active_env.get("ADOBEPY_TARGET", "default")
     if _TARGET.fullmatch(target) is None:
         raise PreflightError("target", "ADOBEPY_TARGET must be a bounded canonical identifier")
+    extension_path = Path(os.path.abspath(extension_path))
+    receipt_path = Path(os.path.abspath(state_dir / "receipts" / "aftereffects.json"))
+    try:
+        mutation_roots = capture_mutation_roots(extension_path, receipt_path)
+    except ValueError as exc:
+        raise PreflightError(
+            "profile", "Extension and receipt roots must not cross links or reparse points"
+        ) from exc
     return ResolvedInstall(
         host_path=host_path,
         host_version=host_version,
         python_path=python_path.resolve(),
         python_version=metadata["python"],
         core_version=metadata["core"],
-        extension_path=extension_path.resolve(),
-        receipt_path=(state_dir / "receipts" / "aftereffects.json").resolve(),
+        extension_path=extension_path,
+        receipt_path=receipt_path,
         bootstrap_error_path=(state_dir / "bootstrap-errors.json").resolve(),
         adobepy_cli=bridge_cli,
         token=token,
@@ -1700,6 +1752,7 @@ def resolve_install(
         python_modules=modules,
         bridge_identity=bridge_identity or {},
         host_identity=host_identity,
+        mutation_roots=mutation_roots,
     )
 
 
@@ -1710,6 +1763,7 @@ __all__ = [
     "MIN_PYTHON_VERSION",
     "PreflightError",
     "capture_python_modules",
+    "capture_mutation_roots",
     "default_extension_path",
     "default_state_dir",
     "host_process_executable",

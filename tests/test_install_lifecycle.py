@@ -14,6 +14,7 @@ from dcc_mcp_aftereffects.install_contract import (
     EXIT_PREFLIGHT,
 )
 from dcc_mcp_aftereffects.install_discovery import (
+    capture_mutation_roots,
     capture_python_modules,
     default_extension_path,
 )
@@ -133,14 +134,16 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
     )
     cli_bytes = bridge_cli.read_bytes()
     manifest_bytes = bridge_manifest.read_bytes()
+    extension_path = tmp_path / "CEP" / "extensions" / "dcc-mcp-aftereffects"
+    receipt_path = tmp_path / "state" / "receipts" / "aftereffects.json"
     return ResolvedInstall(
         host_path=host,
         host_version="24.6",
         python_path=Path(sys.executable),
         python_version="3.12.10",
         core_version="0.20.8",
-        extension_path=tmp_path / "CEP" / "extensions" / "dcc-mcp-aftereffects",
-        receipt_path=tmp_path / "state" / "receipts" / "aftereffects.json",
+        extension_path=extension_path,
+        receipt_path=receipt_path,
         bootstrap_error_path=tmp_path / "state" / "bootstrap-errors.json",
         adobepy_cli=bridge_cli,
         token=secret,
@@ -180,6 +183,7 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
             },
         },
         python_modules=_python_module_identities(tmp_path),
+        mutation_roots=capture_mutation_roots(extension_path, receipt_path),
     )
 
 

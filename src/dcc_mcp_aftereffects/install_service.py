@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .__version__ import __version__
@@ -17,7 +19,12 @@ from .install_contract import (
     SCHEMA_VERSION,
     runtime_core_version,
 )
-from .install_discovery import PreflightError, recapture_python_modules, resolve_install
+from .install_discovery import (
+    PreflightError,
+    capture_mutation_roots,
+    recapture_python_modules,
+    resolve_install,
+)
 from .install_io import (
     IdentityAttestationError,
     InstallIoError,
@@ -26,6 +33,7 @@ from .install_io import (
     commit_staged_install,
     create_staging_dir,
     file_manifest,
+    prepare_install_directories,
     remove_receipted_install,
     remove_staging,
     run_adobepy_install_bridge,
@@ -121,9 +129,85 @@ def _recapture_resolved_python(
         return None
 
 
+def _recapture_resolved_mutation_roots(resolved: ResolvedInstall) -> dict[str, Any] | None:
+    try:
+        expected = deepcopy(dict(resolved.mutation_roots))
+        if not expected:
+            return None
+        current = capture_mutation_roots(resolved.extension_path, resolved.receipt_path)
+    except BaseException:
+        return None
+
+    def compatible(expected_root: Any, current_root: Any) -> bool:
+        if not isinstance(expected_root, dict) or not isinstance(current_root, dict):
+            return False
+        if expected_root.get("target") != current_root.get("target"):
+            return False
+        expected_ancestors = expected_root.get("ancestors")
+        current_ancestors = current_root.get("ancestors")
+        if not isinstance(expected_ancestors, list) or not isinstance(current_ancestors, list):
+            return False
+        if len(expected_ancestors) != len(current_ancestors):
+            return False
+        for prior, observed in zip(expected_ancestors, current_ancestors):
+            if not isinstance(prior, dict) or not isinstance(observed, dict):
+                return False
+            if prior.get("path") != observed.get("path"):
+                return False
+            if prior.get("state") == "missing":
+                if observed.get("state") not in {"missing", "directory"}:
+                    return False
+            elif observed != prior:
+                return False
+        return True
+
+    if set(expected) != {"extension", "receipt"} or set(current) != set(expected):
+        return None
+    return current if all(compatible(expected[key], current[key]) for key in expected) else None
+
+
+def _physical_identity_paths(*values: Any) -> tuple[Path, ...]:
+    paths: dict[str, Path] = {}
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            path = value.get("path")
+            if isinstance(path, str) and isinstance(value.get("physical"), dict):
+                candidate = Path(path)
+                if candidate.exists():
+                    paths[os.path.normcase(str(candidate.absolute()))] = candidate
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect(nested)
+
+    for value in values:
+        collect(value)
+    return tuple(paths[key] for key in sorted(paths))
+
+
+def _attested_identity_paths(resolved: ResolvedInstall) -> tuple[Path, ...]:
+    return _physical_identity_paths(
+        dict(resolved.host_identity),
+        dict(resolved.python_modules),
+        dict(resolved.mutation_roots),
+    )
+
+
+def _attested_mutation_root_paths(resolved: ResolvedInstall) -> tuple[Path, ...]:
+    return _physical_identity_paths(dict(resolved.mutation_roots))
+
+
 def _require_exact_install_attestations(
     resolved: ResolvedInstall, dependencies: LifecycleDependencies
 ) -> ResolvedInstall:
+    mutation_roots = _recapture_resolved_mutation_roots(resolved)
+    if mutation_roots is None:
+        raise IdentityAttestationError(
+            "The extension or receipt mutation roots could not be recaptured exactly",
+            stage="mutation_roots",
+        )
     try:
         host_identity = recapture_resolved_host(resolved, dependencies)
     except BaseException:
@@ -143,6 +227,7 @@ def _require_exact_install_attestations(
         resolved,
         host_identity=host_identity,
         python_modules=python_modules,
+        mutation_roots=mutation_roots,
     )
 
 
@@ -227,6 +312,24 @@ def _install_or_upgrade(
             EXIT_PREFLIGHT,
         )
 
+    mutation_roots = _recapture_resolved_mutation_roots(resolved)
+    if mutation_roots is None:
+        reason = "The extension or receipt mutation roots could not be recaptured exactly"
+        steps[0] = {"id": "preflight", "status": "failed", "message": reason}
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                mode=mode,
+                failure_stage="mutation_roots",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
+
     host_identity = recapture_resolved_host(resolved, dependencies)
     if host_identity is None:
         reason = (
@@ -268,7 +371,51 @@ def _install_or_upgrade(
         )
     resolved = replace(resolved, python_modules=python_modules)
 
-    staged = create_staging_dir(resolved.extension_path)
+    try:
+        mutation_roots = prepare_install_directories(
+            (resolved.extension_path, resolved.receipt_path),
+            before_mutation=lambda: _require_exact_install_attestations(resolved, dependencies),
+            identity_paths=_attested_identity_paths(resolved),
+            capture_after=lambda: capture_mutation_roots(
+                resolved.extension_path, resolved.receipt_path
+            ),
+        )
+        resolved = replace(resolved, mutation_roots=mutation_roots)
+        staged = create_staging_dir(
+            resolved.extension_path,
+            before_mutation=lambda: _require_exact_install_attestations(resolved, dependencies),
+            identity_paths=_attested_identity_paths(resolved),
+        )
+    except IdentityAttestationError as exc:
+        reason = str(exc)
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                mode=mode,
+                failure_stage=exc.stage,
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
+    except BaseException:
+        reason = "The extension or receipt mutation roots could not be prepared safely"
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                mode=mode,
+                failure_stage="mutation_roots",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
     try:
         run_adobepy_install_bridge(
             cli=resolved.adobepy_cli,
@@ -325,6 +472,9 @@ def _install_or_upgrade(
             identity_attestor=lambda: bool(
                 _require_exact_install_attestations(resolved, dependencies)
             ),
+            identity_paths=_attested_identity_paths(resolved),
+            mutation_root_attestor=lambda: _recapture_resolved_mutation_roots(resolved) is not None,
+            mutation_root_paths=_attested_mutation_root_paths(resolved),
         )
         steps[2]["status"] = "ok"
         steps[3]["status"] = "ok"
@@ -414,6 +564,16 @@ def _install_or_upgrade(
             )
         try:
             transaction.finalize()
+        except IdentityAttestationError as exc:
+            return _identity_attestation_failure(
+                resolved,
+                state=state,
+                steps=combined_steps,
+                mode=mode,
+                failure_stage=exc.stage,
+                reason=str(exc),
+                transaction=transaction,
+            )
         except RestartRequired as exc:
             return _transaction_failure(
                 resolved,
@@ -480,6 +640,16 @@ def _install_or_upgrade(
         )
     try:
         transaction.finalize()
+    except IdentityAttestationError as exc:
+        return _identity_attestation_failure(
+            resolved,
+            state=state,
+            steps=combined_steps,
+            mode=mode,
+            failure_stage=exc.stage,
+            reason=str(exc),
+            transaction=transaction,
+        )
     except RestartRequired as exc:
         return _transaction_failure(
             resolved,
@@ -564,8 +734,50 @@ def _uninstall(
         )
     if request.dry_run or not request.yes:
         return build_report(resolved, status="planned", state=state, steps=steps), EXIT_OK
+    mutation_roots = _recapture_resolved_mutation_roots(resolved)
+    if mutation_roots is None:
+        reason = "The extension or receipt mutation roots could not be recaptured exactly"
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                failure_stage="mutation_roots",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
+    resolved = replace(resolved, mutation_roots=mutation_roots)
+
+    def require_mutation_roots() -> None:
+        if _recapture_resolved_mutation_roots(resolved) is None:
+            raise IdentityAttestationError(
+                "The extension or receipt mutation roots could not be recaptured exactly",
+                stage="mutation_roots",
+            )
+
     try:
-        remove_receipted_install(resolved.extension_path, resolved.receipt_path)
+        remove_receipted_install(
+            resolved.extension_path,
+            resolved.receipt_path,
+            before_mutation=require_mutation_roots,
+            identity_paths=_attested_identity_paths(resolved),
+        )
+    except IdentityAttestationError as exc:
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                failure_stage=exc.stage,
+                failure_reason=str(exc),
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
     except RestartRequired as exc:
         reason = str(exc)
         return (
