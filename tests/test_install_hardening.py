@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import zipfile
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -254,6 +256,26 @@ def test_host_attestation_uses_os_owned_helper_and_detects_later_byte_swaps(
         )
         is None
     )
+
+
+def test_host_path_drift_fails_before_any_signature_helper_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "Adobe After Effects 2025" / "Support Files" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZtrusted-afterfx")
+    expected = _test_host_attestation(host, "25.0.0")
+    expected["host"]["path"] = str(tmp_path / "foreign" / "AfterFX.exe")  # type: ignore[index]
+    calls: list[Path] = []
+
+    def attest(path: Path, *_args, **_kwargs):
+        calls.append(path)
+        return deepcopy(expected)
+
+    monkeypatch.setattr(install_discovery, "trusted_host_attestation", attest)
+
+    assert reattest_host(host, expected) is False
+    assert calls == []
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows catalog trust APIs")
@@ -629,7 +651,52 @@ def _release_cli(tmp_path: Path) -> Path:
     return cli
 
 
-def _resolve_public_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _test_host_attestation(host: Path, version: str = "24.0") -> dict[str, object]:
+    host_bytes = host.read_bytes() if host.is_file() else b"MZnative-test-host"
+    helper = host.parent / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return {
+        "platform": "win32",
+        "version": version,
+        "host": {
+            "path": str(host.resolve()),
+            "bytes": len(host_bytes),
+            "sha256": hashlib.sha256(host_bytes).hexdigest(),
+        },
+        "signature_helper": {
+            "path": str(helper.resolve()),
+            "bytes": 23,
+            "sha256": "b" * 64,
+            "subject": "CN=Microsoft Windows, O=Microsoft Corporation",
+            "product": "Windows PowerShell",
+            "original": "powershell.exe",
+            "version": "10.0.26100.1",
+        },
+    }
+
+
+def _drifted_attestation(identity: dict[str, object], mode: str) -> dict[str, object] | None:
+    if mode == "failure":
+        return None
+    if mode == "empty":
+        return {}
+    observed = deepcopy(identity)
+    if mode == "identity-change":
+        observed["host"]["sha256"] = "c" * 64  # type: ignore[index]
+    elif mode == "path-drift":
+        observed["host"]["path"] = "C:\\Foreign\\AfterFX.exe"  # type: ignore[index]
+    elif mode == "metadata-drift":
+        observed["signature_helper"]["product"] = "Foreign PowerShell"  # type: ignore[index]
+    else:  # pragma: no cover - protects the test decision table itself
+        raise AssertionError(f"unknown drift mode: {mode}")
+    return observed
+
+
+def _resolve_public_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    attestations: list[dict[str, object] | None] | None = None,
+):
     host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
     host.parent.mkdir(parents=True)
     host.write_bytes(b"MZnative-test-host")
@@ -651,10 +718,13 @@ def _resolve_public_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "asset": f"adobepy-{version}-windows-x64.zip",
         },
     )
-    monkeypatch.setattr(
-        "dcc_mcp_aftereffects.install_discovery._trusted_host_version",
-        lambda _path, _platform: "24.0",
-    )
+    stable_identity = _test_host_attestation(host)
+    attestation_results = iter(attestations or [stable_identity, stable_identity])
+
+    def attest(*_args, **_kwargs):
+        return deepcopy(next(attestation_results))
+
+    monkeypatch.setattr(install_discovery, "trusted_host_attestation", attest)
     environ = {
         "APPDATA": str(tmp_path / "Roaming"),
         "LOCALAPPDATA": str(tmp_path / "Local"),
@@ -701,6 +771,158 @@ def test_public_preflight_rejects_shadow_adapter_module(
 
     with pytest.raises(PreflightError, match="owned by their selected distributions"):
         _resolve_public_install(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("second", [None, {}], ids=["failure", "empty"])
+def test_resolve_install_requires_a_nonempty_second_host_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second: dict[str, object] | None,
+) -> None:
+    host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
+    initial = _test_host_attestation(host)
+
+    with pytest.raises(PreflightError, match="could not be recaptured"):
+        _resolve_public_install(
+            tmp_path,
+            monkeypatch,
+            attestations=[initial, second],
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["identity-change", "path-drift", "metadata-drift"],
+)
+def test_resolve_install_rejects_any_second_attestation_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
+    initial = _test_host_attestation(host)
+    changed = _drifted_attestation(initial, mode)
+
+    with pytest.raises(PreflightError, match="changed during preflight"):
+        _resolve_public_install(
+            tmp_path,
+            monkeypatch,
+            attestations=[initial, changed],
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing-expected",
+        "failure",
+        "empty",
+        "identity-change",
+        "path-drift",
+        "metadata-drift",
+    ],
+)
+def test_install_recaptures_the_exact_host_before_any_staging_or_installer_process(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    base = resolved_install(tmp_path)
+    expected = _test_host_attestation(base.host_path, base.host_version)
+    resolved_identity = {} if mode == "missing-expected" else expected
+    resolved = replace(base, host_identity=resolved_identity)
+    observed = expected if mode == "missing-expected" else _drifted_attestation(expected, mode)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+    attestation_calls: list[tuple[Path, dict[str, object]]] = []
+
+    def recapture(path: Path, identity: dict[str, object]):
+        attestation_calls.append((path, deepcopy(identity)))
+        return deepcopy(observed)
+
+    dependencies.host_attestation_probe = recapture
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT
+    assert report["verify"]["failure_stage"] == "host_attestation"
+    expected_calls = [] if mode == "missing-expected" else [(resolved.host_path, expected)]
+    assert attestation_calls == expected_calls
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+    assert not list(resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.stage-*"))
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing-expected",
+        "failure",
+        "empty",
+        "identity-change",
+        "path-drift",
+        "metadata-drift",
+    ],
+)
+def test_verify_requires_exact_host_recapture_before_import_or_runtime_processes(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    base = resolved_install(tmp_path)
+    expected = _test_host_attestation(base.host_path, base.host_version)
+    resolved = replace(base, host_identity=expected)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+    dependencies.host_attestation_probe = lambda _path, identity: deepcopy(identity)
+
+    _, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK
+
+    verify_resolved = (
+        replace(resolved, host_identity={}) if mode == "missing-expected" else resolved
+    )
+    observed = expected if mode == "missing-expected" else _drifted_attestation(expected, mode)
+    dependencies.host_attestation_probe = lambda _path, _identity: deepcopy(observed)
+    probe_calls = {"import": 0, "readiness": 0, "process": 0}
+    original_import = dependencies.import_probe
+    original_readiness = dependencies.readiness_probe
+    original_process = dependencies.process_probe
+
+    def import_probe(path: Path):
+        probe_calls["import"] += 1
+        return original_import(path)
+
+    def readiness_probe(current):
+        probe_calls["readiness"] += 1
+        return original_readiness(current)
+
+    def process_probe(pid: int):
+        probe_calls["process"] += 1
+        return original_process(pid)
+
+    dependencies.import_probe = import_probe
+    dependencies.readiness_probe = readiness_probe
+    dependencies.process_probe = process_probe
+    bridge_calls = len(runner.calls)
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("verify", as_json=True),
+        resolved=verify_resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY
+    assert report["verify"]["failure_stage"] == "host_attestation"
+    assert len(runner.calls) == bridge_calls
+    assert probe_calls == {"import": 0, "readiness": 0, "process": 0}
 
 
 def test_ready_probe_without_exact_runtime_identity_fails_closed(tmp_path: Path) -> None:

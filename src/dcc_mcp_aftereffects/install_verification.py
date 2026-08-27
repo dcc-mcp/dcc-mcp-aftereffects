@@ -15,7 +15,7 @@ from .install_discovery import (
     PreflightError,
     _version_key,
     host_process_executable,
-    reattest_host,
+    recapture_host_attestation,
 )
 from .install_io import (
     read_receipt,
@@ -191,6 +191,24 @@ class LifecycleDependencies:
     readiness_probe: Callable[[ResolvedInstall], AfterEffectsStatus] = _default_readiness_probe
     process_probe: Callable[[int], dict[str, Any]] = observe_process_identity
     receipt_writer: Callable[[Path, Mapping[str, Any]], None] = write_receipt
+    host_attestation_probe: Callable[[Path, Mapping[str, Any]], dict[str, Any] | None] = (
+        recapture_host_attestation
+    )
+
+
+def recapture_resolved_host(
+    resolved: ResolvedInstall, dependencies: LifecycleDependencies
+) -> dict[str, Any] | None:
+    """Recapture the exact resolved identity through the injected trust boundary."""
+    try:
+        expected = dict(resolved.host_identity)
+        if not expected:
+            return None
+        observed = dependencies.host_attestation_probe(resolved.host_path, expected)
+        current = dict(observed) if observed is not None else None
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return current if current == expected else None
 
 
 def installation_state(resolved: ResolvedInstall) -> tuple[str, dict[str, Any] | None]:
@@ -210,10 +228,8 @@ def installation_state(resolved: ResolvedInstall) -> tuple[str, dict[str, Any] |
         receipt.get("receipt_version") != 1
         or receipt.get("host_path") != str(resolved.host_path)
         or receipt.get("host_version") != resolved.host_version
-        or (
-            bool(resolved.host_identity)
-            and receipt.get("host_identity") != dict(resolved.host_identity)
-        )
+        or not resolved.host_identity
+        or receipt.get("host_identity") != dict(resolved.host_identity)
         or receipt.get("python") != str(resolved.python_path)
         or receipt.get("python_version") != resolved.python_version
         or receipt.get("target") != resolved.target
@@ -383,8 +399,24 @@ def verify_install(
     resolved: ResolvedInstall,
     dependencies: LifecycleDependencies,
 ) -> tuple[dict[str, Any], int]:
+    host_identity = recapture_resolved_host(resolved, dependencies)
     state, _receipt = installation_state(resolved)
     steps = [{"id": "receipt", "status": "ok" if state == "installed" else "failed"}]
+    if host_identity is None:
+        reason = "The signed After Effects host identity could not be recaptured exactly"
+        steps.append({"id": "host-attestation", "status": "failed", "message": reason})
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                failure_stage="host_attestation",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_VERIFY,
+        )
     if state != "installed":
         reason = "A complete matching install receipt is required before verification"
         return (
@@ -396,21 +428,6 @@ def verify_install(
                 failure_stage="receipt",
                 failure_reason=reason,
                 next_steps=[next_step(retry_command(request), reason, "repair-install")],
-            ),
-            EXIT_VERIFY,
-        )
-    if resolved.host_identity and not reattest_host(resolved.host_path, resolved.host_identity):
-        reason = "The signed After Effects host or OS signature helper changed after preflight"
-        steps.append({"id": "host-attestation", "status": "failed", "message": reason})
-        return (
-            build_report(
-                resolved,
-                status="failed",
-                state=state,
-                steps=steps,
-                failure_stage="host_attestation",
-                failure_reason=reason,
-                next_steps=[],
             ),
             EXIT_VERIFY,
         )
@@ -481,4 +498,9 @@ def verify_install(
     )
 
 
-__all__ = ["LifecycleDependencies", "installation_state", "verify_install"]
+__all__ = [
+    "LifecycleDependencies",
+    "installation_state",
+    "recapture_resolved_host",
+    "verify_install",
+]

@@ -513,17 +513,35 @@ def trusted_host_attestation(
     }
 
 
+def recapture_host_attestation(path: Path, expected: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the exact current host attestation or fail closed on any drift."""
+    if not expected:
+        return None
+    try:
+        expected_identity = dict(expected)
+        platform = expected["platform"]
+        expected_host = Path(expected["host"]["path"]).resolve()
+        helper = Path(expected["signature_helper"]["path"])
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(platform, str):
+        return None
+    try:
+        current_host = _host_binary(path, platform).resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    if os.path.normcase(str(current_host)) != os.path.normcase(str(expected_host)):
+        return None
+    try:
+        current = trusted_host_attestation(path, platform, helper_path=helper)
+    except (OSError, TypeError, ValueError):
+        return None
+    return current if current is not None and current == expected_identity else None
+
+
 def reattest_host(path: Path, expected: Mapping[str, Any]) -> bool:
     """Re-run signature verification and byte binding immediately before readiness."""
-    try:
-        platform = expected["platform"]
-        helper = Path(expected["signature_helper"]["path"])
-    except (KeyError, TypeError):
-        return False
-    if not isinstance(platform, str):
-        return False
-    current = trusted_host_attestation(path, platform, helper_path=helper)
-    return current == dict(expected)
+    return recapture_host_attestation(path, expected) is not None
 
 
 def default_extension_path(
@@ -621,7 +639,7 @@ def _host_version(path: Path) -> str:
 
 def _resolve_host(
     request: InstallRequest, platform: str, environ: Mapping[str, str]
-) -> tuple[Path, str]:
+) -> tuple[Path, str, dict[str, Any]]:
     if request.dcc_path:
         host_path = Path(request.dcc_path).expanduser()
     else:
@@ -682,18 +700,24 @@ def _resolve_host(
             "host",
             "--dcc-path must select a canonical After Effects AfterFX.exe or application bundle",
         )
-    version = _trusted_host_version(resolved_host, platform)
-    if version is None:
+    host_identity = trusted_host_attestation(resolved_host, platform, environ=environ)
+    if not host_identity:
         raise PreflightError(
             "host",
             "After Effects product metadata or platform signature could not be verified",
         )
+    try:
+        version = host_identity["version"]
+    except KeyError as exc:
+        raise PreflightError(
+            "host", "After Effects signed product metadata omitted its version"
+        ) from exc
     if _version_key(version) < MIN_HOST_VERSION:
         raise PreflightError(
             "host_version",
             f"After Effects {version} is unsupported; version {MIN_HOST_VERSION} or newer is required",
         )
-    return resolved_host, version
+    return resolved_host, version, host_identity
 
 
 def host_process_executable(host_path: Path) -> Path:
@@ -975,8 +999,20 @@ def resolve_install(
 ) -> ResolvedInstall:
     active_platform = platform or sys.platform
     active_env = os.environ if environ is None else environ
-    host_path, host_version = _resolve_host(request, active_platform, active_env)
-    host_identity = trusted_host_attestation(host_path, active_platform, environ=active_env) or {}
+    host_path, host_version, initial_host_identity = _resolve_host(
+        request, active_platform, active_env
+    )
+    host_identity = trusted_host_attestation(host_path, active_platform, environ=active_env)
+    if not host_identity:
+        raise PreflightError(
+            "host_attestation",
+            "The signed After Effects host identity could not be recaptured",
+        )
+    if host_identity != initial_host_identity:
+        raise PreflightError(
+            "host_attestation",
+            "The signed After Effects host identity changed during preflight",
+        )
     python_path = Path(request.python or sys.executable).expanduser()
     if not python_path.is_file():
         raise PreflightError("python", f"Target Python does not exist: {python_path}")
@@ -1122,6 +1158,7 @@ __all__ = [
     "default_extension_path",
     "default_state_dir",
     "host_process_executable",
+    "recapture_host_attestation",
     "reattest_bridge_cli",
     "resolve_install",
 ]

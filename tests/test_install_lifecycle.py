@@ -52,6 +52,11 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
     host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
     host.parent.mkdir(parents=True)
     host.write_bytes(b"host")
+    signature_helper = (
+        tmp_path / "Windows" / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
+    signature_helper.parent.mkdir(parents=True)
+    signature_helper.write_bytes(b"powershell")
     bridge_bundle = tmp_path / "adobepy-0.6.2-windows-x64"
     bridge_cli = bridge_bundle / "bin" / "adobepy.exe"
     bridge_cli.parent.mkdir(parents=True)
@@ -93,6 +98,24 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
             "manifest_bytes": len(manifest_bytes),
             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
             "provenance": "official_checksum_release",
+        },
+        host_identity={
+            "platform": "win32",
+            "version": "24.6",
+            "host": {
+                "path": str(host.resolve()),
+                "bytes": host.stat().st_size,
+                "sha256": hashlib.sha256(host.read_bytes()).hexdigest(),
+            },
+            "signature_helper": {
+                "path": str(signature_helper.resolve()),
+                "bytes": signature_helper.stat().st_size,
+                "sha256": hashlib.sha256(signature_helper.read_bytes()).hexdigest(),
+                "subject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                "product": "Windows PowerShell",
+                "original": "powershell.exe",
+                "version": "10.0.26100.1",
+            },
         },
     )
 
@@ -164,6 +187,9 @@ def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
         import_probe=lambda _python: (True, "adapter imports passed"),
         readiness_probe=bound_readiness,
         process_probe=lambda pid: bound_process_probe(pid, current["resolved"]),
+        host_attestation_probe=lambda path, expected: (
+            dict(expected) if path == Path(expected["host"]["path"]) else None
+        ),
     )
 
 
