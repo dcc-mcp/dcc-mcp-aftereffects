@@ -59,6 +59,32 @@ def _validator() -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
+def _recording_windows_signature_runner(executed: list[list[str]]):
+    def run(command, **_kwargs):
+        executed.append([str(item) for item in command])
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(
+                {
+                    "helperStatus": "Valid",
+                    "helperSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                    "helperProduct": "Windows PowerShell",
+                    "helperOriginal": "powershell.exe",
+                    "helperVersion": "10.0.26100.1",
+                    "status": "Valid",
+                    "subject": "CN=Adobe Inc., O=Adobe Inc.",
+                    "product": "Adobe After Effects",
+                    "original": "AfterFX.exe",
+                    "version": "25.0.0",
+                }
+            ),
+            "",
+        )
+
+    return run
+
+
 def test_packaged_schema_is_the_exact_core_contract() -> None:
     _validator()
 
@@ -228,6 +254,87 @@ def test_host_attestation_uses_os_owned_helper_and_detects_later_byte_swaps(
         )
         is None
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows catalog trust APIs")
+def test_native_windows_catalog_signed_powershell_is_trusted_without_environment() -> None:
+    helper = install_discovery._signature_helper(
+        "win32",
+        {"SystemRoot": "C:/attacker", "SYSTEMROOT": "C:/attacker", "PATH": "C:/attacker"},
+    )
+
+    assert helper is not None
+    path, identity = helper
+    assert path == install_discovery._windows_directory() / Path(
+        "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    assert identity["bytes"] > 0
+    assert len(identity["sha256"]) == 64
+    assert install_discovery._win_verify_trust(path) is True
+
+
+def test_helper_native_trust_is_rechecked_immediately_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_root = tmp_path / "Windows"
+    helper = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-helper")
+    host = tmp_path / "Adobe After Effects 2025" / "Support Files" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZtrusted-afterfx")
+    trust_results = iter([True, False])
+    executed: list[list[str]] = []
+    monkeypatch.setattr(install_discovery, "_windows_directory", lambda: system_root)
+    monkeypatch.setattr(
+        install_discovery,
+        "_win_verify_trust",
+        lambda _path: next(trust_results),
+    )
+    monkeypatch.setattr(
+        install_discovery.subprocess,
+        "run",
+        _recording_windows_signature_runner(executed),
+    )
+
+    assert trusted_host_attestation(host, "win32", environ={}) is None
+    assert executed == []
+
+
+def test_helper_identity_is_recaptured_immediately_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_root = tmp_path / "Windows"
+    helper = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-helper")
+    host = tmp_path / "Adobe After Effects 2025" / "Support Files" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZtrusted-afterfx")
+    helper_identities = iter(
+        [
+            {"path": str(helper), "bytes": 14, "sha256": "a" * 64},
+            {"path": str(helper), "bytes": 14, "sha256": "b" * 64},
+        ]
+    )
+    executed: list[list[str]] = []
+
+    def identity(path: Path, _maximum: int):
+        if path == helper:
+            return next(helper_identities)
+        return {"path": str(path), "bytes": 17, "sha256": "c" * 64}
+
+    monkeypatch.setattr(install_discovery, "_windows_directory", lambda: system_root)
+    monkeypatch.setattr(install_discovery, "_stable_file_identity", identity)
+    monkeypatch.setattr(install_discovery, "_win_verify_trust", lambda _path: True)
+    monkeypatch.setattr(
+        install_discovery.subprocess,
+        "run",
+        _recording_windows_signature_runner(executed),
+    )
+
+    assert trusted_host_attestation(host, "win32", environ={}) is None
+    assert executed == []
 
 
 def test_upgrade_rolls_back_payload_and_receipt_when_live_verify_fails(tmp_path: Path) -> None:
@@ -427,6 +534,17 @@ def test_host_override_rejects_unsigned_afterfx_spoof(
 
 
 @pytest.mark.parametrize(
+    ("helper_product", "helper_original", "helper_is_valid"),
+    [
+        ("Windows PowerShell", "powershell.exe", True),
+        ("Microsoft Windows Operating System", "powershell.exe", True),
+        ("Microsoft® Windows® Operating System", "PowerShell.EXE.MUI", True),
+        ("Microsoft(R) Windows(R) Operating System", "powershell.exe.mui", True),
+        ("Untrusted Windows PowerShell", "powershell.exe", False),
+        ("Windows PowerShell", "powershell.exe.backup", False),
+    ],
+)
+@pytest.mark.parametrize(
     ("subject", "product", "original", "expected"),
     [
         ("CN=Adobe Inc., OU=Release", "Adobe After Effects 2024", "AfterFX.exe", "24.6.1"),
@@ -442,6 +560,9 @@ def test_windows_host_trust_requires_adobe_signer_product_and_original_filename(
     product: str,
     original: str,
     expected: str | None,
+    helper_product: str,
+    helper_original: str,
+    helper_is_valid: bool,
 ) -> None:
     host = tmp_path / "AfterFX.exe"
     host.write_bytes(b"MZ")
@@ -453,8 +574,8 @@ def test_windows_host_trust_requires_adobe_signer_product_and_original_filename(
         {
             "helperStatus": "Valid",
             "helperSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
-            "helperProduct": "Windows PowerShell",
-            "helperOriginal": "powershell.exe",
+            "helperProduct": helper_product,
+            "helperOriginal": helper_original,
             "helperVersion": "10.0.26100.1",
             "status": "Valid",
             "subject": subject,
@@ -471,7 +592,7 @@ def test_windows_host_trust_requires_adobe_signer_product_and_original_filename(
     monkeypatch.setattr(install_discovery, "_windows_directory", lambda: tmp_path / "Windows")
     monkeypatch.setattr(install_discovery, "_win_verify_trust", lambda _path: True)
 
-    assert _trusted_host_version(host, "win32") == expected
+    assert _trusted_host_version(host, "win32") == (expected if helper_is_valid else None)
 
 
 def test_bridge_cli_requires_audited_release_manifest(tmp_path: Path) -> None:
