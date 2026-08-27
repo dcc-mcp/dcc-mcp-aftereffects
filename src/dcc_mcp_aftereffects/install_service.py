@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -18,6 +19,7 @@ from .install_contract import (
 )
 from .install_discovery import PreflightError, recapture_python_modules, resolve_install
 from .install_io import (
+    IdentityAttestationError,
     InstallIoError,
     RestartRequired,
     RollbackError,
@@ -44,6 +46,47 @@ from .install_verification import (
     recapture_resolved_host,
     verify_install,
 )
+
+
+def _python_attestation_failure(
+    resolved: ResolvedInstall,
+    *,
+    state: str,
+    steps: list[dict[str, Any]],
+    mode: str,
+    transaction: Any | None = None,
+) -> tuple[dict[str, Any], int]:
+    reason = "The target Python package identities could not be recaptured exactly"
+    rollback_failed = False
+    if transaction is not None:
+        try:
+            transaction.rollback()
+        except BaseException:
+            rollback_failed = True
+    report = build_report(
+        resolved,
+        status="failed",
+        state=installation_state(resolved)[0] if transaction is not None else state,
+        steps=steps,
+        mode=mode,
+        failure_stage="python_attestation",
+        failure_reason=reason,
+        next_steps=[],
+    )
+    if rollback_failed:
+        report["rollback_failed"] = True
+    return report, EXIT_PREFLIGHT
+
+
+def _recapture_resolved_python(
+    resolved: ResolvedInstall, dependencies: LifecycleDependencies
+) -> dict[str, Any] | None:
+    try:
+        expected = deepcopy(dict(resolved.python_modules))
+        observed = dependencies.python_distribution_probe(resolved.python_path, deepcopy(expected))
+        return recapture_python_modules(expected, observed)
+    except BaseException:
+        return None
 
 
 def _install_or_upgrade(
@@ -149,7 +192,7 @@ def _install_or_upgrade(
         )
     resolved = replace(resolved, host_identity=host_identity)
 
-    python_modules = recapture_python_modules(resolved.python_modules)
+    python_modules = _recapture_resolved_python(resolved, dependencies)
     if python_modules is None:
         reason = "The target Python package identities could not be recaptured exactly"
         steps[0] = {"id": "preflight", "status": "failed", "message": reason}
@@ -180,6 +223,24 @@ def _install_or_upgrade(
             runner=dependencies.bridge_runner,
         )
         steps[1]["status"] = "ok"
+        python_modules = _recapture_resolved_python(resolved, dependencies)
+        if python_modules is None:
+            reason = "The target Python package identities could not be recaptured exactly"
+            steps[2] = {"id": "commit-extension", "status": "failed", "message": reason}
+            return (
+                build_report(
+                    resolved,
+                    status="failed",
+                    state=state,
+                    steps=steps,
+                    mode=mode,
+                    failure_stage="python_attestation",
+                    failure_reason=reason,
+                    next_steps=[],
+                ),
+                EXIT_PREFLIGHT,
+            )
+        resolved = replace(resolved, python_modules=python_modules)
         receipt_payload = {
             "schema_version": SCHEMA_VERSION,
             "dcc_type": "aftereffects",
@@ -204,9 +265,27 @@ def _install_or_upgrade(
             receipt=receipt_payload,
             receipt_path=resolved.receipt_path,
             receipt_writer=dependencies.receipt_writer,
+            identity_attestor=lambda: (
+                _recapture_resolved_python(resolved, dependencies) is not None
+            ),
         )
         steps[2]["status"] = "ok"
         steps[3]["status"] = "ok"
+    except IdentityAttestationError as exc:
+        reason = str(exc)
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=installation_state(resolved)[0],
+                steps=steps,
+                mode=mode,
+                failure_stage="python_attestation",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
     except RestartRequired as exc:
         reason = str(exc)
         return (
@@ -261,6 +340,16 @@ def _install_or_upgrade(
     steps[4]["status"] = "ok" if verify_exit == EXIT_OK else "failed"
     combined_steps = steps + verify_report["steps"]
     if verify_exit == EXIT_OK:
+        python_modules = _recapture_resolved_python(resolved, dependencies)
+        if python_modules is None:
+            return _python_attestation_failure(
+                resolved,
+                state=state,
+                steps=combined_steps,
+                mode=mode,
+                transaction=transaction,
+            )
+        resolved = replace(resolved, python_modules=python_modules)
         try:
             transaction.finalize()
         except RestartRequired as exc:
@@ -291,23 +380,11 @@ def _install_or_upgrade(
         )
     reason = verify_report["verify"]["failure_reason"] or "After Effects must load the CEP bridge"
     if request.command == "upgrade" and transaction.moved_existing:
+        rollback_failed = False
         try:
             transaction.rollback()
-        except OSError:
-            rollback_reason = "The previous After Effects extension could not be restored"
-            return (
-                build_report(
-                    resolved,
-                    status="failed",
-                    state="partial",
-                    steps=combined_steps,
-                    mode=mode,
-                    failure_stage="rollback",
-                    failure_reason=rollback_reason,
-                    next_steps=[],
-                ),
-                EXIT_INSTALL,
-            )
+        except BaseException:
+            rollback_failed = True
         report = build_report(
             resolved,
             status="failed",
@@ -318,29 +395,32 @@ def _install_or_upgrade(
             failure_reason=reason,
             next_steps=verify_report.get("next_steps", []),
         )
-        report["previous_install_restored"] = True
+        if rollback_failed:
+            report["rollback_failed"] = True
+        else:
+            report["previous_install_restored"] = True
         return report, verify_exit
     failure_stage = verify_report["verify"].get("failure_stage")
     if failure_stage != "readiness":
+        rollback_failed = False
         try:
             transaction.rollback()
-        except OSError:
-            rollback_reason = "The failed install could not be rolled back safely"
-            return (
-                build_report(
-                    resolved,
-                    status="failed",
-                    state="partial",
-                    steps=combined_steps,
-                    mode=mode,
-                    failure_stage="rollback",
-                    failure_reason=rollback_reason,
-                    next_steps=[],
-                ),
-                EXIT_INSTALL,
-            )
+        except BaseException:
+            rollback_failed = True
+        if rollback_failed:
+            verify_report["rollback_failed"] = True
         return verify_report, verify_exit
     try:
+        python_modules = _recapture_resolved_python(resolved, dependencies)
+        if python_modules is None:
+            return _python_attestation_failure(
+                resolved,
+                state=state,
+                steps=combined_steps,
+                mode=mode,
+                transaction=transaction,
+            )
+        resolved = replace(resolved, python_modules=python_modules)
         transaction.finalize()
     except RestartRequired as exc:
         reason = str(exc)

@@ -1,5 +1,9 @@
 import json
 import re
+import subprocess
+import sys
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -35,6 +39,42 @@ def test_adapter_uses_shared_adobepy_runtime():
     assert not adobepy.specifier.contains("0.8.0")
     assert '"dcc-mcp-core>=0.20.14,<1.0.0"' in contents
     assert not (root / "src" / "dcc_mcp_aftereffects" / "bridge.py").exists()
+
+
+def test_built_wheel_skills_match_package_and_install_core_contract(tmp_path):
+    root = Path(__file__).parents[1]
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheel = next(tmp_path.glob("*.whl"))
+    expected = ">=0.20.14,<1.0.0"
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_name = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        metadata = BytesParser().parsebytes(archive.read(metadata_name))
+        core = next(
+            Requirement(value)
+            for value in metadata.get_all("Requires-Dist", [])
+            if Requirement(value).name == "dcc-mcp-core"
+        )
+        assert str(core.specifier) == "<1.0.0,>=0.20.14"
+        skills = [
+            name for name in archive.namelist() if "/skills/" in name and name.endswith("/SKILL.md")
+        ]
+        advertised = []
+        for name in skills:
+            contents = archive.read(name).decode("utf-8")
+            if "dcc-mcp-core" in contents:
+                advertised.append(name)
+                assert f"dcc-mcp-core {expected}" in contents
+        assert len(advertised) == 3
+    install_guide = (root / "install.md").read_text(encoding="utf-8")
+    assert install_guide.count(expected) >= 4
 
 
 def test_start_server_defers_port_resolution_to_core(monkeypatch):

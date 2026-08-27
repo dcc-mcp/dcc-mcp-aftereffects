@@ -2,7 +2,7 @@
 name: aftereffects-layers
 description: Inspect and edit After Effects compositions, layers, transforms, text, effects, masks, and keyframes through typed adobepy facades.
 license: MIT
-compatibility: "After Effects CEP/ExtendScript; dcc-mcp-core 0.19+"
+compatibility: "After Effects CEP/ExtendScript; dcc-mcp-core >=0.20.14,<1.0.0"
 allowed-tools: Python
 metadata:
   dcc-mcp:

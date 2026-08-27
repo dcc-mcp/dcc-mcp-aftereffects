@@ -15,6 +15,7 @@ from .install_discovery import (
     PreflightError,
     _version_key,
     host_process_executable,
+    inspect_python_distributions,
     recapture_host_attestation,
 )
 from .install_io import (
@@ -194,6 +195,9 @@ class LifecycleDependencies:
     host_attestation_probe: Callable[[Path, Mapping[str, Any]], dict[str, Any] | None] = (
         recapture_host_attestation
     )
+    python_distribution_probe: Callable[[Path, Mapping[str, Any]], Mapping[str, Any]] = (
+        inspect_python_distributions
+    )
 
 
 def recapture_resolved_host(
@@ -254,7 +258,7 @@ def _runtime_identity_failure(
     return False, stage, reason, error_type
 
 
-def _validate_runtime_identity(
+def _validate_runtime_identity_checked(
     status: AfterEffectsStatus,
     resolved: ResolvedInstall,
     process_probe: Callable[[int], dict[str, Any]],
@@ -377,32 +381,45 @@ def _validate_runtime_identity(
         host_after = process_probe(host_pid)
         broker_before = process_probe(broker_pid)
         broker_after = process_probe(broker_pid)
-    except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
-        return _runtime_identity_failure(
-            "readiness_identity",
-            "The reported PID/start/path identity is stale or foreign",
-            "process_identity_mismatch",
+        process_identity_matches = (
+            all(
+                isinstance(observed, Mapping)
+                for observed in (host_before, host_after, broker_before, broker_after)
+            )
+            and host_before.get("ok") is True
+            and host_before == host_after
+            and _same_path(host_before.get("executable"), expected_host_executable)
+            and host_before.get("process_start_identity") == identity["process_start_identity"]
+            and broker_before.get("ok") is True
+            and broker_before == broker_after
+            and _same_path(broker_before.get("executable"), expected_broker)
+            and broker_before.get("process_start_identity") == broker["process_start_identity"]
         )
-    if (
-        not all(
-            isinstance(observed, Mapping)
-            for observed in (host_before, host_after, broker_before, broker_after)
-        )
-        or host_before.get("ok") is not True
-        or host_before != host_after
-        or not _same_path(host_before.get("executable"), expected_host_executable)
-        or host_before.get("process_start_identity") != identity["process_start_identity"]
-        or broker_before.get("ok") is not True
-        or broker_before != broker_after
-        or not _same_path(broker_before.get("executable"), expected_broker)
-        or broker_before.get("process_start_identity") != broker["process_start_identity"]
-    ):
+    except BaseException:
+        process_identity_matches = False
+    if not process_identity_matches:
         return _runtime_identity_failure(
             "readiness_identity",
             "The reported PID/start/path identity is stale or foreign",
             "process_identity_mismatch",
         )
     return True, None, None, None
+
+
+def _validate_runtime_identity(
+    status: AfterEffectsStatus,
+    resolved: ResolvedInstall,
+    process_probe: Callable[[int], dict[str, Any]],
+) -> tuple[bool, str | None, str | None, str | None]:
+    """Treat all untrusted runtime-attestation access failures as one closed result."""
+    try:
+        return _validate_runtime_identity_checked(status, resolved, process_probe)
+    except BaseException:
+        return _runtime_identity_failure(
+            "readiness_identity",
+            "The reported PID/start/path identity is stale or foreign",
+            "process_identity_mismatch",
+        )
 
 
 def verify_install(
@@ -464,15 +481,24 @@ def verify_install(
             ),
             EXIT_VERIFY,
         )
-    status = dependencies.readiness_probe(resolved)
-    identity_ok, failure_stage, failure_reason, error_type = _validate_runtime_identity(
-        status, resolved, dependencies.process_probe
-    )
+    try:
+        status = dependencies.readiness_probe(resolved)
+        identity_ok, failure_stage, failure_reason, error_type = _validate_runtime_identity(
+            status, resolved, dependencies.process_probe
+        )
+        readiness_message = status.reason or failure_reason or "exact runtime identity verified"
+    except BaseException:
+        identity_ok, failure_stage, failure_reason, error_type = _runtime_identity_failure(
+            "readiness_identity",
+            "The reported PID/start/path identity is stale or foreign",
+            "process_identity_mismatch",
+        )
+        readiness_message = failure_reason
     steps.append(
         {
             "id": "typed-readiness",
             "status": "ok" if identity_ok else "failed",
-            "message": status.reason or failure_reason or "exact runtime identity verified",
+            "message": readiness_message,
         }
     )
     if not identity_ok:

@@ -230,6 +230,25 @@ def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
         current["resolved"] = resolved
         return readiness(resolved)
 
+    def python_distributions(_python: Path, expected):
+        observed = {}
+        for key, identity in expected.items():
+            direct_url_path = Path(identity["metadata_path"]) / "direct_url.json"
+            observed[key] = {
+                "name": identity["metadata_name"],
+                "distribution": identity["distribution"],
+                "version": identity["version"],
+                "module_path": identity["module_path"],
+                "distribution_root": identity["distribution_root"],
+                "metadata_path": identity["metadata_path"],
+                "direct_url": (
+                    json.loads(direct_url_path.read_text(encoding="utf-8"))
+                    if direct_url_path.is_file()
+                    else None
+                ),
+            }
+        return observed
+
     return LifecycleDependencies(
         bridge_runner=runner,
         import_probe=lambda _python: (True, "adapter imports passed"),
@@ -238,6 +257,7 @@ def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
         host_attestation_probe=lambda path, expected: (
             dict(expected) if path == Path(expected["host"]["path"]) else None
         ),
+        python_distribution_probe=python_distributions,
     )
 
 

@@ -1075,9 +1075,18 @@ def capture_python_modules(raw_modules: Mapping[str, Any]) -> dict[str, Any]:
         ) from exc
 
 
-def recapture_python_modules(expected: Mapping[str, Any]) -> dict[str, Any] | None:
+def recapture_python_modules(
+    expected: Mapping[str, Any], observed: Mapping[str, Any] | None = None
+) -> dict[str, Any] | None:
     """Recapture exact Python distribution state without importing changed modules."""
-    if not isinstance(expected, Mapping) or set(expected) != set(_PYTHON_MODULES):
+    if (
+        not isinstance(expected, Mapping)
+        or set(expected) != set(_PYTHON_MODULES)
+        or (
+            observed is not None
+            and (not isinstance(observed, Mapping) or set(observed) != set(_PYTHON_MODULES))
+        )
+    ):
         return None
     current: dict[str, Any] = {}
     required = {
@@ -1098,52 +1107,152 @@ def recapture_python_modules(expected: Mapping[str, Any]) -> dict[str, Any] | No
             identity = expected[key]
             if not isinstance(identity, Mapping) or set(identity) != required:
                 return None
-            if (
-                identity.get("distribution") != distribution
-                or identity.get("owned") is not True
-                or _normalized_distribution_name(identity.get("metadata_name"))
-                != _normalized_distribution_name(distribution)
-            ):
+            if identity.get("distribution") != distribution or identity.get("owned") is not True:
                 return None
-            _version_key(identity.get("version"))
             module_path = _absolute_path(identity.get("module_path"))
             distribution_root = _absolute_path(identity.get("distribution_root"))
             metadata_path = _absolute_path(identity.get("metadata_path"))
-            ownership = identity.get("ownership")
-            if not isinstance(ownership, Mapping) or set(ownership) != {"kind", "root"}:
-                return None
-            ownership_root = _absolute_path(ownership.get("root"))
-            package_path = Path(*package.split(".")) / "__init__.py"
-            if ownership.get("kind") == "editable":
-                candidates = (
-                    ownership_root / "src" / package_path,
-                    ownership_root / package_path,
+            if observed is None:
+                metadata_snapshot = _metadata_identity(metadata_path, distribution_root)
+                metadata_contents = _captured_metadata_bytes(
+                    metadata_path, metadata_snapshot, "METADATA", required=True
                 )
-                if module_path not in {Path(os.path.abspath(item)) for item in candidates}:
-                    return None
-            elif ownership.get("kind") == "installed":
-                if module_path != Path(os.path.abspath(distribution_root / package_path)):
-                    return None
+                headers = BytesParser().parsebytes(metadata_contents, headersonly=True)
+                direct_url_contents = _captured_metadata_bytes(
+                    metadata_path, metadata_snapshot, "direct_url.json", required=False
+                )
+                direct_url = (
+                    json.loads(direct_url_contents) if direct_url_contents is not None else None
+                )
+                raw = {
+                    "name": headers.get("Name"),
+                    "distribution": distribution,
+                    "version": headers.get("Version"),
+                    "module_path": str(module_path),
+                    "distribution_root": str(distribution_root),
+                    "metadata_path": str(metadata_path),
+                    "direct_url": direct_url,
+                }
             else:
+                raw = observed[key]
+                if not isinstance(raw, Mapping):
+                    return None
+            captured = _capture_python_module(
+                raw,
+                distribution,
+                package,
+            )
+            if captured != dict(identity):
                 return None
-            module_snapshot = _module_identity(module_path, ownership_root)
-            metadata_snapshot = _metadata_identity(metadata_path, distribution_root)
-            record = identity.get("record")
-            if ownership.get("kind") == "installed" and (
-                not isinstance(record, Mapping)
-                or record.get("size") != module_snapshot["file"]["bytes"]
-                or not _record_hash_matches(module_snapshot["file"]["sha256"], record.get("hash"))
-            ):
-                return None
-            current[key] = {
-                **dict(identity),
-                "record": dict(record) if isinstance(record, Mapping) else None,
-                "module_identity": module_snapshot,
-                "metadata_identity": metadata_snapshot,
-            }
-    except (KeyError, OSError, TypeError, ValueError):
+            current[key] = captured
+    except (json.JSONDecodeError, KeyError, OSError, TypeError, UnicodeError, ValueError):
         return None
     return current if current == dict(expected) else None
+
+
+def inspect_python_distributions(python_path: Path, _expected: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the selected interpreter's unique distributions without importing their modules."""
+    script = r"""
+import importlib.metadata as metadata
+import json
+import os
+import pathlib
+import sys
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
+
+
+PRODUCTS = {
+    "adapter": ("dcc-mcp-aftereffects", "dcc_mcp_aftereffects"),
+    "core": ("dcc-mcp-core", "dcc_mcp_core"),
+    "adobepy": ("adobepy", "adobe.after_effects"),
+}
+
+
+def editable_root(value):
+    if not isinstance(value, dict) or set(value) != {"url", "dir_info"}:
+        return None
+    info = value.get("dir_info")
+    parsed = urlparse(value.get("url", ""))
+    if not isinstance(info, dict) or info.get("editable") is not True:
+        return None
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return None
+    raw = url2pathname(unquote(parsed.path))
+    if os.name == "nt" and len(raw) >= 3 and raw[0] == "/" and raw[2] == ":":
+        raw = raw[1:]
+    return pathlib.Path(os.path.abspath(raw))
+
+
+def describe(distribution_name, package):
+    matches = list(metadata.distributions(name=distribution_name))
+    if len(matches) != 1:
+        raise RuntimeError("target distribution is missing or ambiguous")
+    distribution = matches[0]
+    root = pathlib.Path(os.path.abspath(distribution.locate_file("")))
+    raw_direct_url = distribution.read_text("direct_url.json")
+    direct_url = json.loads(raw_direct_url) if raw_direct_url else None
+    package_path = pathlib.Path(*package.split(".")) / "__init__.py"
+    editable = editable_root(direct_url)
+    if editable is None:
+        module_path = root / package_path
+    else:
+        candidates = [editable / "src" / package_path, editable / package_path]
+        existing = [candidate for candidate in candidates if candidate.is_file()]
+        if len(existing) != 1:
+            raise RuntimeError("editable module path is missing or ambiguous")
+        module_path = existing[0]
+    return {
+        "name": distribution.metadata.get("Name"),
+        "distribution": distribution_name,
+        "version": distribution.version,
+        "module_path": str(pathlib.Path(os.path.abspath(module_path))),
+        "distribution_root": str(root),
+        "metadata_path": str(pathlib.Path(os.path.abspath(distribution._path))),
+        "direct_url": direct_url,
+    }
+
+
+print(json.dumps({
+    "python_executable": str(pathlib.Path(os.path.abspath(sys.executable))),
+    "modules": {
+        key: describe(distribution, package)
+        for key, (distribution, package) in PRODUCTS.items()
+    },
+}))
+""".strip()
+    environment = dict(os.environ)
+    environment.pop("ADOBEPY_TOKEN", None)
+    try:
+        completed = subprocess.run(
+            [str(python_path), "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PreflightError(
+            "python", "Target Python distributions could not be inspected"
+        ) from exc
+    try:
+        if completed.returncode != 0 or len((completed.stdout or "").encode()) > 262_144:
+            raise ValueError("target distribution inspection failed")
+        payload = json.loads(completed.stdout)
+        executable = _absolute_path(payload["python_executable"])
+        modules = payload["modules"]
+        if os.path.normcase(str(executable)) != os.path.normcase(
+            str(_absolute_path(str(python_path)))
+        ):
+            raise ValueError("target interpreter identity changed")
+        if not isinstance(modules, dict):
+            raise ValueError("target distribution identities are invalid")
+        return modules
+    except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PreflightError(
+            "python", "Target Python distributions could not be inspected"
+        ) from exc
 
 
 def _python_metadata(python_path: Path) -> dict[str, Any]:
@@ -1539,6 +1648,7 @@ __all__ = [
     "default_extension_path",
     "default_state_dir",
     "host_process_executable",
+    "inspect_python_distributions",
     "recapture_host_attestation",
     "recapture_python_modules",
     "reattest_bridge_cli",
