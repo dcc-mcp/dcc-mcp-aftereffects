@@ -38,7 +38,10 @@ class RollbackError(InstallIoError):
 
 
 class IdentityAttestationError(InstallIoError):
-    pass
+    def __init__(self, message: str, *, stage: str = "python_attestation"):
+        super().__init__(message)
+        self.stage = stage
+        self.rollback_failed = False
 
 
 def _redact(value: str, secret: str | None) -> str:
@@ -391,6 +394,16 @@ class InstallTransaction:
     moved_existing: bool = False
     committed_new: bool = False
     closed: bool = False
+    recovery_archive: Path | None = None
+
+    def _prior_receipt(self) -> dict[str, Any] | None:
+        if self.old_receipt is None or not self.old_receipt_valid:
+            return None
+        try:
+            payload = json.loads(self.old_receipt.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def rollback(self) -> None:
         if self.closed:
@@ -400,9 +413,17 @@ class InstallTransaction:
             if self.committed_new and self.destination.exists():
                 _replace_with_retry(self.destination, failed)
             if self.moved_existing:
-                if not self.backup.exists():
-                    raise OSError("previous After Effects extension backup is missing")
-                _replace_with_retry(self.backup, self.destination)
+                prior_receipt = self._prior_receipt()
+                if prior_receipt is not None and receipt_files_match(prior_receipt, self.backup):
+                    _replace_with_retry(self.backup, self.destination)
+                elif self.recovery_archive is not None and prior_receipt is not None:
+                    _restore_recovery_archive(
+                        self.recovery_archive,
+                        self.destination,
+                        prior_receipt,
+                    )
+                else:
+                    raise OSError("previous After Effects extension backup is unavailable")
             if self.old_receipt is None:
                 self.receipt_path.unlink(missing_ok=True)
             else:
@@ -417,16 +438,45 @@ class InstallTransaction:
                 safe_remove_tree(failed)
             if self.closed and self.backup.exists():
                 safe_remove_tree(self.backup)
+            if self.closed and self.recovery_archive is not None:
+                try:
+                    self.recovery_archive.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def finalize(self) -> None:
         if self.closed:
             return
         if self.backup.exists():
+            prior_receipt = self._prior_receipt()
+            if prior_receipt is None or not receipt_files_match(prior_receipt, self.backup):
+                raise RestartRequired(
+                    "The previous extension backup could not be captured for safe cleanup"
+                )
+            recovery_archive = self.backup.with_name(
+                f".{self.backup.name}.recovery-{uuid4().hex}.zip"
+            )
+            try:
+                _write_recovery_archive(self.backup, prior_receipt, recovery_archive)
+                _validate_recovery_archive(recovery_archive, self.backup, prior_receipt)
+            except OSError as exc:
+                recovery_archive.unlink(missing_ok=True)
+                raise RestartRequired(
+                    "The previous extension backup could not be captured for safe cleanup"
+                ) from exc
+            self.recovery_archive = recovery_archive
             cleanup = safe_remove_tree(self.backup)
             if not cleanup.get("success"):
                 raise RestartRequired(
                     "The verified previous extension backup is locked until After Effects restarts"
                 )
+            try:
+                recovery_archive.unlink()
+            except OSError as exc:
+                raise RestartRequired(
+                    "The previous extension recovery snapshot could not be cleaned safely"
+                ) from exc
+            self.recovery_archive = None
         self.closed = True
 
 
@@ -463,7 +513,18 @@ def commit_staged_install(
     )
 
     def require_identity() -> None:
-        if identity_attestor is not None and identity_attestor() is not True:
+        if identity_attestor is None:
+            return
+        try:
+            verified = identity_attestor()
+        except IdentityAttestationError:
+            raise
+        except BaseException as exc:
+            raise IdentityAttestationError(
+                "The install identities could not be recaptured exactly",
+                stage="identity_attestation",
+            ) from exc
+        if verified is not True:
             raise IdentityAttestationError(
                 "The target Python package identities could not be recaptured exactly"
             )
@@ -486,10 +547,8 @@ def commit_staged_install(
     except IdentityAttestationError as exc:
         try:
             transaction.rollback()
-        except OSError:
-            raise RollbackError(
-                "Python identity attestation failed and the previous extension could not be restored"
-            ) from exc
+        except BaseException:
+            exc.rollback_failed = True
         raise
     except (OSError, TypeError, ValueError) as exc:
         try:

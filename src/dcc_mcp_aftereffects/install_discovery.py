@@ -86,57 +86,35 @@ def _path_uses_link(path: Path) -> bool:
     return False
 
 
-def _stable_file_bytes(path: Path, maximum: int) -> bytes | None:
+def _stable_file_snapshot(path: Path, maximum: int) -> tuple[bytes, dict[str, Any]] | None:
     try:
         if _path_uses_link(path):
             return None
-        before = path.stat()
-        if before.st_size <= 0 or before.st_size > maximum:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > maximum:
             return None
         contents = path.read_bytes()
-        after = path.stat()
+        after = path.lstat()
     except OSError:
         return None
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    ):
+    if _physical_identity(before) != _physical_identity(after):
         return None
-    return contents
+    return contents, {
+        "path": str(path.resolve()),
+        "bytes": len(contents),
+        "sha256": hashlib.sha256(contents).hexdigest(),
+        "physical": _physical_identity(after),
+    }
+
+
+def _stable_file_bytes(path: Path, maximum: int) -> bytes | None:
+    snapshot = _stable_file_snapshot(path, maximum)
+    return snapshot[0] if snapshot is not None else None
 
 
 def _stable_file_identity(path: Path, maximum: int) -> dict[str, Any] | None:
-    try:
-        if _path_uses_link(path):
-            return None
-        before = path.stat()
-        if before.st_size <= 0 or before.st_size > maximum:
-            return None
-        digest = hashlib.sha256()
-        observed = 0
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                observed += len(chunk)
-                if observed > maximum:
-                    return None
-                digest.update(chunk)
-        after = path.stat()
-    except OSError:
-        return None
-    if observed != before.st_size or (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-        return None
-    return {
-        "path": str(path.resolve()),
-        "bytes": observed,
-        "sha256": digest.hexdigest(),
-    }
+    snapshot = _stable_file_snapshot(path, maximum)
+    return snapshot[1] if snapshot is not None else None
 
 
 def _signature_helper(
@@ -1013,8 +991,15 @@ def _capture_python_module(
     if direct_url != raw.get("direct_url"):
         raise ValueError("editable source does not match distribution metadata")
     editable_root = _local_editable_root(direct_url)
+    raw_records = raw.get("records")
+    if not isinstance(raw_records, list) or any(
+        not isinstance(item, Mapping) for item in raw_records
+    ):
+        raise ValueError("target interpreter returned invalid RECORD semantics")
     record: Mapping[str, Any] | None = None
     if editable_root is not None:
+        if raw_records:
+            raise ValueError("editable module unexpectedly has an installed RECORD owner")
         candidates = (editable_root / "src" / package_path, editable_root / package_path)
         if module_path not in {Path(os.path.abspath(candidate)) for candidate in candidates}:
             raise ValueError("editable module is outside its source ownership")
@@ -1028,6 +1013,8 @@ def _capture_python_module(
             metadata_path, metadata_snapshot, "RECORD", required=True
         )
         record = _record_identity(record_contents, package_path)
+        if len(raw_records) != 1 or dict(raw_records[0]) != dict(record):
+            raise ValueError("installed module lacks one target-interpreter RECORD owner")
         record_path = Path(str(record.get("path") or ""))
         if (
             record_path.is_absolute()
@@ -1154,6 +1141,8 @@ def inspect_python_distributions(python_path: Path, _expected: Mapping[str, Any]
     """Read the selected interpreter's unique distributions without importing their modules."""
     script = r"""
 import importlib.metadata as metadata
+import csv
+import io
 import json
 import os
 import pathlib
@@ -1196,12 +1185,25 @@ def describe(distribution_name, package):
     editable = editable_root(direct_url)
     if editable is None:
         module_path = root / package_path
+        raw_record = distribution.read_text("RECORD")
+        if raw_record is None:
+            raise RuntimeError("installed distribution RECORD is missing")
+        rows = list(csv.reader(io.StringIO(raw_record, newline="")))
+        records = []
+        for row in rows:
+            if len(row) == 3 and row[0] == package_path.as_posix():
+                try:
+                    size = int(row[2])
+                except ValueError as exc:
+                    raise RuntimeError("installed distribution RECORD is malformed") from exc
+                records.append({"path": row[0], "hash": row[1], "size": size})
     else:
         candidates = [editable / "src" / package_path, editable / package_path]
         existing = [candidate for candidate in candidates if candidate.is_file()]
         if len(existing) != 1:
             raise RuntimeError("editable module path is missing or ambiguous")
         module_path = existing[0]
+        records = []
     return {
         "name": distribution.metadata.get("Name"),
         "distribution": distribution_name,
@@ -1210,6 +1212,7 @@ def describe(distribution_name, package):
         "distribution_root": str(root),
         "metadata_path": str(pathlib.Path(os.path.abspath(distribution._path))),
         "direct_url": direct_url,
+        "records": records,
     }
 
 
@@ -1260,6 +1263,8 @@ def _python_metadata(python_path: Path) -> dict[str, Any]:
 import hashlib
 import importlib.metadata as metadata
 import importlib.resources as resources
+import csv
+import io
 import json
 import os
 import pathlib
@@ -1270,10 +1275,31 @@ import dcc_mcp_aftereffects
 import dcc_mcp_core
 
 
-def describe(distribution_name, module):
-    distribution = metadata.distribution(distribution_name)
+def describe(distribution_name, module, package):
+    matches = list(metadata.distributions(name=distribution_name))
+    if len(matches) != 1:
+        raise RuntimeError("target distribution is missing or ambiguous")
+    distribution = matches[0]
     module_path = pathlib.Path(os.path.abspath(module.__file__))
     raw_direct_url = distribution.read_text("direct_url.json")
+    direct_url = json.loads(raw_direct_url) if raw_direct_url else None
+    records = []
+    if not (
+        isinstance(direct_url, dict)
+        and isinstance(direct_url.get("dir_info"), dict)
+        and direct_url["dir_info"].get("editable") is True
+    ):
+        raw_record = distribution.read_text("RECORD")
+        if raw_record is None:
+            raise RuntimeError("installed distribution RECORD is missing")
+        package_path = pathlib.Path(*package.split("."), "__init__.py").as_posix()
+        for row in csv.reader(io.StringIO(raw_record, newline="")):
+            if len(row) == 3 and row[0] == package_path:
+                try:
+                    size = int(row[2])
+                except ValueError as exc:
+                    raise RuntimeError("installed distribution RECORD is malformed") from exc
+                records.append({"path": row[0], "hash": row[1], "size": size})
     return {
         "name": distribution.metadata.get("Name"),
         "distribution": distribution_name,
@@ -1283,7 +1309,8 @@ def describe(distribution_name, module):
             pathlib.Path(os.path.abspath(distribution.locate_file("")))
         ),
         "metadata_path": str(pathlib.Path(os.path.abspath(distribution._path))),
-        "direct_url": json.loads(raw_direct_url) if raw_direct_url else None,
+        "direct_url": direct_url,
+        "records": records,
     }
 
 
@@ -1297,10 +1324,10 @@ print(json.dumps({
     "python_executable": sys.executable,
     "modules": {
         "adapter": describe(
-            "dcc-mcp-aftereffects", dcc_mcp_aftereffects
+            "dcc-mcp-aftereffects", dcc_mcp_aftereffects, "dcc_mcp_aftereffects"
         ),
-        "core": describe("dcc-mcp-core", dcc_mcp_core),
-        "adobepy": describe("adobepy", adobe.after_effects),
+        "core": describe("dcc-mcp-core", dcc_mcp_core, "dcc_mcp_core"),
+        "adobepy": describe("adobepy", adobe.after_effects, "adobe.after_effects"),
     },
     "core_schema": {
         "id": schema.get("$id"),
@@ -1352,12 +1379,14 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
         if _path_uses_link(selected_path):
             return None
         path = selected_path.resolve(strict=True)
-        contents = _stable_file_bytes(path, 2_147_483_647)
+        cli_snapshot = _stable_file_snapshot(path, 2_147_483_647)
         bundle = path.parent.parent
         manifest_path = bundle / "package-manifest.json"
-        manifest_contents = _stable_file_bytes(manifest_path, 65_536)
-        if contents is None or manifest_contents is None:
+        manifest_snapshot = _stable_file_snapshot(manifest_path, 65_536)
+        if cli_snapshot is None or manifest_snapshot is None:
             return None
+        contents, cli_identity = cli_snapshot
+        manifest_contents, manifest_identity = manifest_snapshot
         manifest = json.loads(manifest_contents.decode("utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return None
@@ -1428,9 +1457,11 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
         "runtime": runtime,
         "bytes": len(contents),
         "sha256": actual_sha256,
+        "physical": cli_identity["physical"],
         "manifest_path": str(manifest_path.resolve()),
         "manifest_bytes": len(manifest_contents),
         "manifest_sha256": hashlib.sha256(manifest_contents).hexdigest(),
+        "manifest_physical": manifest_identity["physical"],
         "provenance": "official_checksum_release",
         "source": {
             "repository": "https://github.com/dcc-mcp/adobepy",
@@ -1444,12 +1475,22 @@ def _bridge_cli_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
 def reattest_bridge_cli(path: Path, expected: Mapping[str, Any]) -> bool:
     """Recheck the exact official CLI and manifest immediately before execution."""
     try:
-        expected_path = Path(expected["executable"]).resolve(strict=True)
-        manifest_path = Path(expected["manifest_path"]).resolve(strict=True)
+        expected_path_value = Path(expected["executable"])
+        manifest_path_value = Path(expected["manifest_path"])
+        if (
+            _path_uses_link(path)
+            or _path_uses_link(expected_path_value)
+            or _path_uses_link(manifest_path_value)
+        ):
+            return False
+        expected_path = expected_path_value.resolve(strict=True)
+        manifest_path = manifest_path_value.resolve(strict=True)
         expected_bytes = int(expected["bytes"])
         expected_manifest_bytes = int(expected["manifest_bytes"])
         expected_sha256 = expected["sha256"]
         expected_manifest_sha256 = expected["manifest_sha256"]
+        expected_physical = dict(expected["physical"])
+        expected_manifest_physical = dict(expected["manifest_physical"])
         selected_path = path.resolve(strict=True)
     except (KeyError, OSError, TypeError, ValueError):
         return False
@@ -1463,15 +1504,25 @@ def reattest_bridge_cli(path: Path, expected: Mapping[str, Any]) -> bool:
         or re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256) is None
     ):
         return False
-    contents = _stable_file_bytes(selected_path, 2_147_483_647)
-    manifest_contents = _stable_file_bytes(manifest_path, 65_536)
+    cli_snapshot = _stable_file_snapshot(selected_path, 2_147_483_647)
+    manifest_snapshot = _stable_file_snapshot(manifest_path, 65_536)
     return bool(
-        contents is not None
-        and manifest_contents is not None
-        and len(contents) == expected_bytes
-        and hashlib.sha256(contents).hexdigest() == expected_sha256
-        and len(manifest_contents) == expected_manifest_bytes
-        and hashlib.sha256(manifest_contents).hexdigest() == expected_manifest_sha256
+        cli_snapshot is not None
+        and manifest_snapshot is not None
+        and cli_snapshot[1]
+        == {
+            "path": str(expected_path),
+            "bytes": expected_bytes,
+            "sha256": expected_sha256,
+            "physical": expected_physical,
+        }
+        and manifest_snapshot[1]
+        == {
+            "path": str(manifest_path),
+            "bytes": expected_manifest_bytes,
+            "sha256": expected_manifest_sha256,
+            "physical": expected_manifest_physical,
+        }
     )
 
 

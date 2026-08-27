@@ -96,6 +96,17 @@ def _python_module_identities(tmp_path: Path) -> dict[str, object]:
 
 
 def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> ResolvedInstall:
+    def physical(path: Path) -> dict[str, int]:
+        details = path.lstat()
+        return {
+            "device": int(details.st_dev),
+            "inode": int(details.st_ino),
+            "mode": int(details.st_mode),
+            "links": int(details.st_nlink),
+            "modified_ns": int(details.st_mtime_ns),
+            "changed_ns": int(details.st_ctime_ns),
+        }
+
     host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
     host.parent.mkdir(parents=True)
     host.write_bytes(b"host")
@@ -141,9 +152,11 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
             "runtime": "windows-x64",
             "bytes": len(cli_bytes),
             "sha256": hashlib.sha256(cli_bytes).hexdigest(),
+            "physical": physical(bridge_cli),
             "manifest_path": str(bridge_manifest.resolve()),
             "manifest_bytes": len(manifest_bytes),
             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "manifest_physical": physical(bridge_manifest),
             "provenance": "official_checksum_release",
         },
         host_identity={
@@ -153,11 +166,13 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
                 "path": str(host.resolve()),
                 "bytes": host.stat().st_size,
                 "sha256": hashlib.sha256(host.read_bytes()).hexdigest(),
+                "physical": physical(host),
             },
             "signature_helper": {
                 "path": str(signature_helper.resolve()),
                 "bytes": signature_helper.stat().st_size,
                 "sha256": hashlib.sha256(signature_helper.read_bytes()).hexdigest(),
+                "physical": physical(signature_helper),
                 "subject": "CN=Microsoft Windows, O=Microsoft Corporation",
                 "product": "Windows PowerShell",
                 "original": "powershell.exe",
@@ -246,6 +261,7 @@ def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
                     if direct_url_path.is_file()
                     else None
                 ),
+                "records": [identity["record"]] if identity["record"] is not None else [],
             }
         return observed
 
