@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,6 +41,7 @@ from .install_reporting import (
 from .install_verification import (
     LifecycleDependencies,
     installation_state,
+    recapture_resolved_host,
     verify_install,
 )
 
@@ -124,6 +126,28 @@ def _install_or_upgrade(
             ),
             EXIT_PREFLIGHT,
         )
+
+    host_identity = recapture_resolved_host(resolved, dependencies)
+    if host_identity is None:
+        reason = (
+            "The signed After Effects host identity could not be recaptured exactly "
+            "before installation"
+        )
+        steps[0] = {"id": "preflight", "status": "failed", "message": reason}
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                mode=mode,
+                failure_stage="host_attestation",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
+    resolved = replace(resolved, host_identity=host_identity)
 
     staged = create_staging_dir(resolved.extension_path)
     try:
