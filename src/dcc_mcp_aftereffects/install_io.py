@@ -25,6 +25,72 @@ from dcc_mcp_core.install_lifecycle import inspect_install_root, safe_remove_tre
 
 from .install_discovery import reattest_bridge_cli
 
+if os.name == "nt":
+    from ctypes import wintypes as _wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", _wintypes.DWORD),
+            ("creation_time", _wintypes.FILETIME),
+            ("access_time", _wintypes.FILETIME),
+            ("write_time", _wintypes.FILETIME),
+            ("volume_serial", _wintypes.DWORD),
+            ("size_high", _wintypes.DWORD),
+            ("size_low", _wintypes.DWORD),
+            ("links", _wintypes.DWORD),
+            ("file_index_high", _wintypes.DWORD),
+            ("file_index_low", _wintypes.DWORD),
+        ]
+
+    class _FileRenameInformation(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_ubyte),
+            ("root_directory", _wintypes.HANDLE),
+            ("file_name_length", _wintypes.DWORD),
+            ("file_name", _wintypes.WCHAR * 1),
+        ]
+
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _KERNEL32.CreateFileW.argtypes = [
+        _wintypes.LPCWSTR,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
+        _wintypes.LPVOID,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
+        _wintypes.HANDLE,
+    ]
+    _KERNEL32.CreateFileW.restype = _wintypes.HANDLE
+    _KERNEL32.GetFileInformationByHandle.argtypes = [
+        _wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    _KERNEL32.GetFileInformationByHandle.restype = _wintypes.BOOL
+    _KERNEL32.SetFilePointerEx.argtypes = [
+        _wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        _wintypes.DWORD,
+    ]
+    _KERNEL32.SetFilePointerEx.restype = _wintypes.BOOL
+    _KERNEL32.ReadFile.argtypes = [
+        _wintypes.HANDLE,
+        _wintypes.LPVOID,
+        _wintypes.DWORD,
+        ctypes.POINTER(_wintypes.DWORD),
+        _wintypes.LPVOID,
+    ]
+    _KERNEL32.ReadFile.restype = _wintypes.BOOL
+    _KERNEL32.SetFileInformationByHandle.argtypes = [
+        _wintypes.HANDLE,
+        ctypes.c_int,
+        _wintypes.LPVOID,
+        _wintypes.DWORD,
+    ]
+    _KERNEL32.SetFileInformationByHandle.restype = _wintypes.BOOL
+    _KERNEL32.CloseHandle.argtypes = [_wintypes.HANDLE]
+    _KERNEL32.CloseHandle.restype = _wintypes.BOOL
+
 
 class InstallIoError(RuntimeError):
     pass
@@ -228,6 +294,16 @@ def read_receipt(path: Path) -> dict[str, Any] | None:
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _receipt_from_bytes(contents: bytes) -> dict[str, Any] | None:
+    if len(contents) > 1_048_576:
+        return None
+    try:
+        value = json.loads(contents.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -534,6 +610,192 @@ def _hold_identity_paths(paths: tuple[Path, ...]) -> Iterator[None]:
                 os.close(handle)
 
 
+@dataclass
+class _ExactObjectLease:
+    """Bind one checked filesystem object to its native handle for a transaction."""
+
+    path: Path
+    physical: Mapping[str, int]
+    is_directory: bool
+    native_handle: Any | None = None
+    file_descriptor: int | None = None
+    closed: bool = False
+
+    @classmethod
+    def acquire(cls, path: Path) -> _ExactObjectLease:
+        path = Path(os.path.abspath(path))
+        if os.name != "nt":
+            descriptor = os.open(path, os.O_RDONLY)
+            details = os.fstat(descriptor)
+            return cls(
+                path=path,
+                physical={
+                    "device": int(details.st_dev),
+                    "inode": int(details.st_ino),
+                    "mode": int(details.st_mode),
+                },
+                is_directory=stat.S_ISDIR(details.st_mode),
+                file_descriptor=descriptor,
+            )
+
+        invalid = _wintypes.HANDLE(-1).value
+        desired_access = 0x00010000 | 0x00000080
+        if not path.is_dir():
+            desired_access |= 0x80000000
+        handle = _KERNEL32.CreateFileW(
+            str(path),
+            desired_access,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = _ByHandleFileInformation()
+        if not _KERNEL32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            _KERNEL32.CloseHandle(handle)
+            raise error
+        if information.attributes & 0x400:
+            _KERNEL32.CloseHandle(handle)
+            raise IdentityAttestationError(
+                "A checked extension or receipt object crossed a link or reparse boundary",
+                stage="identity_attestation",
+            )
+        is_directory = bool(information.attributes & 0x10)
+        return cls(
+            path=path,
+            physical={
+                "volume_serial": int(information.volume_serial),
+                "file_index_high": int(information.file_index_high),
+                "file_index_low": int(information.file_index_low),
+                "attributes": int(information.attributes),
+                "links": int(information.links),
+                "size": (int(information.size_high) << 32) | int(information.size_low),
+            },
+            is_directory=is_directory,
+            native_handle=handle,
+        )
+
+    def read_bytes(self, *, maximum: int = 1_048_576) -> bytes:
+        self._require_open()
+        if self.is_directory:
+            raise IsADirectoryError(str(self.path))
+        if os.name != "nt":
+            if self.file_descriptor is None:
+                raise OSError("exact-object descriptor is unavailable")
+            os.lseek(self.file_descriptor, 0, os.SEEK_SET)
+            contents = os.read(self.file_descriptor, maximum + 1)
+        else:
+            size = int(self.physical.get("size", maximum + 1))
+            if size > maximum:
+                raise OSError("checked receipt exceeds the bounded size limit")
+            if not _KERNEL32.SetFilePointerEx(self.native_handle, 0, None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            buffer = ctypes.create_string_buffer(size)
+            read = _wintypes.DWORD()
+            if not _KERNEL32.ReadFile(
+                self.native_handle,
+                buffer,
+                size,
+                ctypes.byref(read),
+                None,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            contents = buffer.raw[: read.value]
+        if len(contents) > maximum:
+            raise OSError("checked receipt exceeds the bounded size limit")
+        return contents
+
+    def _require_open(self) -> None:
+        if self.closed:
+            raise OSError("exact-object lease is already closed")
+
+    def rename(self, destination: Path, *, replace: bool = False) -> None:
+        self._require_open()
+        destination = Path(os.path.abspath(destination))
+        if os.name != "nt":
+            current = self.path.stat()
+            expected = (
+                self.physical["device"],
+                self.physical["inode"],
+                self.physical["mode"],
+            )
+            if (int(current.st_dev), int(current.st_ino), int(current.st_mode)) != expected:
+                raise IdentityAttestationError(
+                    "A checked extension or receipt object changed inside the transaction",
+                    stage="identity_attestation",
+                )
+            if replace:
+                os.replace(self.path, destination)
+            else:
+                os.rename(self.path, destination)
+            self.path = destination
+            return
+
+        encoded = str(destination).encode("utf-16-le")
+        offset = _FileRenameInformation.file_name.offset
+        buffer = ctypes.create_string_buffer(offset + len(encoded) + ctypes.sizeof(_wintypes.WCHAR))
+        information = ctypes.cast(buffer, ctypes.POINTER(_FileRenameInformation)).contents
+        information.replace_if_exists = int(replace)
+        information.root_directory = None
+        information.file_name_length = len(encoded)
+        ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))
+        if not _KERNEL32.SetFileInformationByHandle(
+            self.native_handle,
+            3,
+            buffer,
+            offset + len(encoded),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.path = destination
+
+    def delete(self) -> None:
+        self._require_open()
+        if os.name != "nt":
+            if self.is_directory:
+                self.path.rmdir()
+            else:
+                self.path.unlink()
+            self.close()
+            return
+
+        delete_file = _wintypes.BOOLEAN(1)
+        if not _KERNEL32.SetFileInformationByHandle(
+            self.native_handle,
+            4,
+            ctypes.byref(delete_file),
+            ctypes.sizeof(delete_file),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        if os.name == "nt":
+            _KERNEL32.CloseHandle(self.native_handle)
+        elif self.file_descriptor is not None:
+            os.close(self.file_descriptor)
+        self.closed = True
+
+
+def _delete_leased_tree(lease: _ExactObjectLease) -> dict[str, Any]:
+    cleanup = safe_remove_tree(lease.path)
+    if lease.path.exists():
+        try:
+            if not lease.path.is_dir() or any(lease.path.iterdir()):
+                return cleanup
+            lease.delete()
+        except OSError as exc:
+            errors = list(cleanup.get("errors", [])) if isinstance(cleanup, dict) else []
+            errors.append(str(exc))
+            return {"success": False, "errors": errors}
+    return {"success": not lease.path.exists(), "errors": []}
+
+
 def _replace_with_retry(
     source: Path,
     destination: Path,
@@ -581,6 +843,8 @@ class InstallTransaction:
     identity_paths: tuple[Path, ...] = ()
     mutation_root_attestor: Callable[[], bool] | None = None
     mutation_root_paths: tuple[Path, ...] = ()
+    previous_extension_lease: _ExactObjectLease | None = None
+    previous_receipt_lease: _ExactObjectLease | None = None
 
     @staticmethod
     def _require_attestation(
@@ -623,13 +887,32 @@ class InstallTransaction:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def _require_previous_receipt_object(self) -> None:
+        if (
+            self.old_receipt is None
+            or self.previous_receipt_lease is None
+            or self.previous_receipt_lease.read_bytes() != self.old_receipt
+        ):
+            raise IdentityAttestationError(
+                "The checked receipt object changed inside the transaction",
+                stage="identity_attestation",
+            )
+
+    def _release_exact_object_leases(self) -> None:
+        if self.previous_extension_lease is not None:
+            self.previous_extension_lease.close()
+            self.previous_extension_lease = None
+        if self.previous_receipt_lease is not None:
+            self.previous_receipt_lease.close()
+            self.previous_receipt_lease = None
+
     def rollback(self) -> None:
         if self.closed:
             return
-        with _hold_identity_paths(self.mutation_root_paths):
-            self._require_mutation_roots()
-            failed = self.destination.with_name(f".{self.destination.name}.failed-{uuid4().hex}")
-            try:
+        failed = self.destination.with_name(f".{self.destination.name}.failed-{uuid4().hex}")
+        try:
+            with _hold_identity_paths(self.mutation_root_paths):
+                self._require_mutation_roots()
                 if self.committed_new and self.destination.exists():
                     self._require_mutation_roots()
                     _replace_with_retry(self.destination, failed)
@@ -639,8 +922,15 @@ class InstallTransaction:
                     if prior_receipt is not None and receipt_files_match(
                         prior_receipt, self.backup
                     ):
-                        _replace_with_retry(self.backup, self.destination)
+                        if self.previous_extension_lease is None:
+                            raise OSError("previous extension object lease is unavailable")
+                        self.previous_extension_lease.rename(self.destination)
                     elif self.recovery_archive is not None and prior_receipt is not None:
+                        if self.previous_extension_lease is not None:
+                            cleanup = _delete_leased_tree(self.previous_extension_lease)
+                            if not cleanup.get("success"):
+                                raise OSError("previous extension backup could not be retired")
+                            self.previous_extension_lease = None
                         _restore_recovery_archive(
                             self.recovery_archive,
                             self.destination,
@@ -650,8 +940,13 @@ class InstallTransaction:
                         raise OSError("previous After Effects extension backup is unavailable")
                 if self.moved_receipt:
                     self._require_mutation_roots()
-                    if self.receipt_backup is not None and self.receipt_backup.exists():
-                        _replace_with_retry(self.receipt_backup, self.receipt_path)
+                    if (
+                        self.receipt_backup is not None
+                        and self.receipt_backup.exists()
+                        and self.previous_receipt_lease is not None
+                    ):
+                        self._require_previous_receipt_object()
+                        self.previous_receipt_lease.rename(self.receipt_path, replace=True)
                     elif self.old_receipt is not None:
                         _write_receipt_bytes(self.receipt_path, self.old_receipt)
                     else:
@@ -660,26 +955,38 @@ class InstallTransaction:
                     self._require_mutation_roots()
                     self.receipt_path.unlink(missing_ok=True)
                 if self.old_receipt_valid:
-                    restored = read_receipt(self.receipt_path)
+                    if self.previous_receipt_lease is not None:
+                        restored = _receipt_from_bytes(self.previous_receipt_lease.read_bytes())
+                    else:
+                        restored = read_receipt(self.receipt_path)
                     if restored is None or not receipt_files_match(restored, self.destination):
                         raise OSError("previous After Effects extension rollback did not validate")
                 self.closed = True
-            finally:
-                if failed.exists():
-                    self._require_mutation_roots()
-                    safe_remove_tree(failed)
-                if self.closed and self.backup.exists():
-                    self._require_mutation_roots()
+        finally:
+            if failed.exists():
+                self._require_mutation_roots()
+                safe_remove_tree(failed)
+            if self.closed and self.backup.exists():
+                self._require_mutation_roots()
+                if self.previous_extension_lease is not None:
+                    _delete_leased_tree(self.previous_extension_lease)
+                    self.previous_extension_lease = None
+                else:
                     safe_remove_tree(self.backup)
-                if self.closed and self.recovery_archive is not None:
-                    try:
-                        self._require_mutation_roots()
-                        self.recovery_archive.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                if self.closed and self.receipt_backup is not None:
+            if self.closed and self.recovery_archive is not None:
+                try:
                     self._require_mutation_roots()
+                    self.recovery_archive.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if self.closed and self.receipt_backup is not None and self.receipt_backup.exists():
+                self._require_mutation_roots()
+                if self.previous_receipt_lease is not None:
+                    self.previous_receipt_lease.delete()
+                    self.previous_receipt_lease = None
+                else:
                     self.receipt_backup.unlink(missing_ok=True)
+            self._release_exact_object_leases()
 
     def finalize(self) -> None:
         if self.closed:
@@ -712,7 +1019,12 @@ class InstallTransaction:
                 self.recovery_archive = recovery_archive
                 try:
                     self._require_identity()
-                    cleanup = safe_remove_tree(self.backup)
+                    if self.previous_extension_lease is None:
+                        raise IdentityAttestationError(
+                            "The checked extension object lease was lost before cleanup",
+                            stage="identity_attestation",
+                        )
+                    cleanup = _delete_leased_tree(self.previous_extension_lease)
                 except IdentityAttestationError:
                     raise
                 except BaseException as exc:
@@ -724,16 +1036,24 @@ class InstallTransaction:
                         "The verified previous extension backup is locked until After Effects "
                         "restarts"
                     )
+                self.previous_extension_lease = None
             if self.receipt_backup is not None and self.receipt_backup.exists():
                 try:
                     self._require_identity()
-                    self.receipt_backup.unlink()
+                    if self.previous_receipt_lease is None:
+                        raise IdentityAttestationError(
+                            "The checked receipt object lease was lost before cleanup",
+                            stage="identity_attestation",
+                        )
+                    self._require_previous_receipt_object()
+                    self.previous_receipt_lease.delete()
                 except IdentityAttestationError:
                     raise
                 except BaseException as exc:
                     raise RestartRequired(
                         "The previous receipt transaction snapshot could not be cleaned safely"
                     ) from exc
+                self.previous_receipt_lease = None
             if self.recovery_archive is not None and self.recovery_archive.exists():
                 try:
                     self._require_identity()
@@ -747,6 +1067,7 @@ class InstallTransaction:
             self.receipt_backup = None
             self.recovery_archive = None
             self.closed = True
+            self._release_exact_object_leases()
 
 
 def commit_staged_install(
@@ -761,18 +1082,43 @@ def commit_staged_install(
     mutation_root_attestor: Callable[[], bool] | None = None,
     mutation_root_paths: tuple[Path, ...] = (),
 ) -> InstallTransaction:
-    inspection = inspect_install_root(destination)
-    if inspection.get("requires_restart"):
-        raise RestartRequired(
-            "The existing extension is loaded and must be released by After Effects"
+    previous_extension_lease = (
+        _ExactObjectLease.acquire(destination)
+        if destination.exists() or destination.is_symlink()
+        else None
+    )
+    try:
+        previous_receipt_lease = (
+            _ExactObjectLease.acquire(receipt_path)
+            if receipt_path.exists() or receipt_path.is_symlink()
+            else None
         )
-    backup = destination.with_name(f".{destination.name}.backup-{uuid4().hex}")
-    receipt_backup = receipt_path.with_name(f".{receipt_path.name}.backup-{uuid4().hex}")
-    if receipt_path.is_file() and receipt_path.stat().st_size <= 1_048_576:
-        old_receipt = receipt_path.read_bytes()
-    else:
-        old_receipt = None
-    old_payload = read_receipt(receipt_path)
+    except BaseException:
+        if previous_extension_lease is not None:
+            previous_extension_lease.close()
+        raise
+    try:
+        inspection = inspect_install_root(destination)
+        if inspection.get("requires_restart"):
+            raise RestartRequired(
+                "The existing extension is loaded and must be released by After Effects"
+            )
+        backup = destination.with_name(f".{destination.name}.backup-{uuid4().hex}")
+        receipt_backup = receipt_path.with_name(f".{receipt_path.name}.backup-{uuid4().hex}")
+        if previous_receipt_lease is not None and not previous_receipt_lease.is_directory:
+            try:
+                old_receipt = previous_receipt_lease.read_bytes()
+            except OSError:
+                old_receipt = None
+        else:
+            old_receipt = None
+        old_payload = _receipt_from_bytes(old_receipt) if old_receipt is not None else None
+    except BaseException:
+        if previous_extension_lease is not None:
+            previous_extension_lease.close()
+        if previous_receipt_lease is not None:
+            previous_receipt_lease.close()
+        raise
     transaction = InstallTransaction(
         destination=destination,
         backup=backup,
@@ -788,6 +1134,8 @@ def commit_staged_install(
         identity_paths=identity_paths,
         mutation_root_attestor=mutation_root_attestor,
         mutation_root_paths=mutation_root_paths,
+        previous_extension_lease=previous_extension_lease,
+        previous_receipt_lease=previous_receipt_lease,
     )
 
     def require_identity() -> None:
@@ -807,23 +1155,29 @@ def commit_staged_install(
                 "The target Python package identities could not be recaptured exactly"
             )
 
+    def rename_checked_object(lease: _ExactObjectLease, target: Path) -> None:
+        with _hold_identity_paths(identity_paths):
+            require_identity()
+            lease.rename(target)
+
     try:
         require_identity()
         if destination.exists():
-            _replace_with_retry(
-                destination,
-                backup,
-                before_mutation=require_identity,
-                identity_paths=identity_paths,
-            )
+            if transaction.previous_extension_lease is None:
+                raise IdentityAttestationError(
+                    "The checked extension object lease was unavailable before backup",
+                    stage="identity_attestation",
+                )
+            rename_checked_object(transaction.previous_extension_lease, backup)
             transaction.moved_existing = True
         if transaction.receipt_backup is not None:
-            _replace_with_retry(
-                receipt_path,
-                transaction.receipt_backup,
-                before_mutation=require_identity,
-                identity_paths=identity_paths,
-            )
+            if transaction.previous_receipt_lease is None:
+                raise IdentityAttestationError(
+                    "The checked receipt object lease was unavailable before backup",
+                    stage="identity_attestation",
+                )
+            transaction._require_previous_receipt_object()
+            rename_checked_object(transaction.previous_receipt_lease, transaction.receipt_backup)
             transaction.moved_receipt = True
         _replace_with_retry(
             staged,
@@ -991,19 +1345,30 @@ def remove_receipted_install(
     with _hold_identity_paths(identity_paths):
         if before_mutation is not None:
             before_mutation()
-        _remove_receipted_install(destination, receipt_path)
+        _remove_receipted_install(
+            destination,
+            receipt_path,
+            before_mutation=before_mutation,
+        )
 
 
-def _remove_receipted_install(destination: Path, receipt_path: Path) -> None:
-    receipt = read_receipt(receipt_path)
-    if receipt is None or not destination.is_dir() or not receipt_files_match(receipt, destination):
-        raise InstallIoError("A complete matching After Effects receipt is required for uninstall")
-    inspection = inspect_install_root(destination)
-    if inspection.get("requires_restart"):
-        raise RestartRequired("After Effects holds the receipted extension open")
+def _remove_receipted_install(
+    destination: Path,
+    receipt_path: Path,
+    *,
+    before_mutation: Callable[[], None] | None = None,
+) -> None:
+    extension_lease = _ExactObjectLease.acquire(destination)
+    try:
+        receipt_lease = _ExactObjectLease.acquire(receipt_path)
+    except BaseException:
+        extension_lease.close()
+        raise
     recovery = destination.with_name(f".{destination.name}.recovery-{uuid4().hex}.zip")
     quarantine = destination.with_name(f".{destination.name}.uninstall-{uuid4().hex}")
-    receipt_bytes = receipt_path.read_bytes()
+    receipt: dict[str, Any] | None = None
+    receipt_bytes = b""
+    moved = False
 
     def cleanup(path: Path) -> bool:
         if not path.exists() and not path.is_symlink():
@@ -1012,12 +1377,25 @@ def _remove_receipted_install(destination: Path, receipt_path: Path) -> None:
         return bool(result.get("success")) and not path.exists()
 
     def restore() -> bool:
+        nonlocal extension_lease, receipt_lease
         try:
-            if not cleanup(destination):
+            if extension_lease is not None:
+                cleanup_result = _delete_leased_tree(extension_lease)
+                if not cleanup_result.get("success"):
+                    raise OSError("After Effects failed destination could not be quarantined")
+                extension_lease = None
+            elif not cleanup(destination):
                 raise OSError("After Effects failed destination could not be quarantined")
+            if receipt is None:
+                raise OSError("After Effects uninstall recovery receipt is unavailable")
             _restore_recovery_archive(recovery, destination, receipt)
-            _write_receipt_bytes(receipt_path, receipt_bytes)
-            restored = read_receipt(receipt_path)
+            if receipt_lease is None:
+                _write_receipt_bytes(receipt_path, receipt_bytes)
+            restored = (
+                _receipt_from_bytes(receipt_lease.read_bytes())
+                if receipt_lease is not None
+                else read_receipt(receipt_path)
+            )
             if restored is None or not receipt_files_match(restored, destination):
                 raise OSError("After Effects uninstall recovery did not validate")
         except OSError:
@@ -1025,15 +1403,44 @@ def _remove_receipted_install(destination: Path, receipt_path: Path) -> None:
         cleanup(quarantine)
         return True
 
-    moved = False
     try:
+        receipt_bytes = receipt_lease.read_bytes()
+        receipt = _receipt_from_bytes(receipt_bytes)
+        if (
+            receipt is None
+            or not destination.is_dir()
+            or not receipt_files_match(receipt, destination)
+        ):
+            raise InstallIoError(
+                "A complete matching After Effects receipt is required for uninstall"
+            )
+        inspection = inspect_install_root(destination)
+        if inspection.get("requires_restart"):
+            raise RestartRequired("After Effects holds the receipted extension open")
+        if before_mutation is not None:
+            before_mutation()
         _write_recovery_archive(destination, receipt, recovery)
         _validate_recovery_archive(recovery, destination, receipt)
-        _replace_with_retry(destination, quarantine)
+        if before_mutation is not None:
+            before_mutation()
+        extension_lease.rename(quarantine)
         moved = True
-        if not cleanup(quarantine):
+        cleanup_result = _delete_leased_tree(extension_lease)
+        if not cleanup_result.get("success"):
             raise PermissionError("After Effects extension cleanup is locked")
-        receipt_path.unlink()
+        extension_lease = None
+        if before_mutation is not None:
+            before_mutation()
+        receipt_lease.delete()
+        receipt_lease = None
+    except IdentityAttestationError as exc:
+        if not moved:
+            cleanup(recovery)
+        elif not restore():
+            exc.rollback_failed = True
+        raise
+    except (InstallIoError, RestartRequired):
+        raise
     except OSError as exc:
         if not moved:
             cleanup(recovery)
@@ -1049,6 +1456,11 @@ def _remove_receipted_install(destination: Path, receipt_path: Path) -> None:
         if _locked_error(exc):
             raise RestartRequired("Uninstall was rolled back because files remain locked") from exc
         raise InstallIoError("Uninstall failed; the receipted extension was restored") from exc
+    finally:
+        if extension_lease is not None:
+            extension_lease.close()
+        if receipt_lease is not None:
+            receipt_lease.close()
     try:
         recovery.unlink()
     except OSError as exc:
