@@ -372,12 +372,23 @@ def _validate_runtime_identity(
             "The ready CEP module origin is missing from the receipted extension",
             "wrong_plugin_origin",
         )
-    host_before = process_probe(host_pid)
-    host_after = process_probe(host_pid)
-    broker_before = process_probe(broker_pid)
-    broker_after = process_probe(broker_pid)
+    try:
+        host_before = process_probe(host_pid)
+        host_after = process_probe(host_pid)
+        broker_before = process_probe(broker_pid)
+        broker_after = process_probe(broker_pid)
+    except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
+        return _runtime_identity_failure(
+            "readiness_identity",
+            "The reported PID/start/path identity is stale or foreign",
+            "process_identity_mismatch",
+        )
     if (
-        host_before.get("ok") is not True
+        not all(
+            isinstance(observed, Mapping)
+            for observed in (host_before, host_after, broker_before, broker_after)
+        )
+        or host_before.get("ok") is not True
         or host_before != host_after
         or not _same_path(host_before.get("executable"), expected_host_executable)
         or host_before.get("process_start_identity") != identity["process_start_identity"]

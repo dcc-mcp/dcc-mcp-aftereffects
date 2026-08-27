@@ -16,7 +16,7 @@ from .install_contract import (
     SCHEMA_VERSION,
     runtime_core_version,
 )
-from .install_discovery import PreflightError, resolve_install
+from .install_discovery import PreflightError, recapture_python_modules, resolve_install
 from .install_io import (
     InstallIoError,
     RestartRequired,
@@ -148,6 +148,25 @@ def _install_or_upgrade(
             EXIT_PREFLIGHT,
         )
     resolved = replace(resolved, host_identity=host_identity)
+
+    python_modules = recapture_python_modules(resolved.python_modules)
+    if python_modules is None:
+        reason = "The target Python package identities could not be recaptured exactly"
+        steps[0] = {"id": "preflight", "status": "failed", "message": reason}
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                mode=mode,
+                failure_stage="python_attestation",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_PREFLIGHT,
+        )
+    resolved = replace(resolved, python_modules=python_modules)
 
     staged = create_staging_dir(resolved.extension_path)
     try:
@@ -302,7 +321,7 @@ def _install_or_upgrade(
         report["previous_install_restored"] = True
         return report, verify_exit
     failure_stage = verify_report["verify"].get("failure_stage")
-    if failure_stage not in {"readiness", "readiness_identity"}:
+    if failure_stage != "readiness":
         try:
             transaction.rollback()
         except OSError:

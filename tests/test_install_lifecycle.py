@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -12,7 +13,10 @@ from dcc_mcp_aftereffects.install_contract import (
     EXIT_OK,
     EXIT_PREFLIGHT,
 )
-from dcc_mcp_aftereffects.install_discovery import default_extension_path
+from dcc_mcp_aftereffects.install_discovery import (
+    capture_python_modules,
+    default_extension_path,
+)
 from dcc_mcp_aftereffects.install_models import InstallRequest, ResolvedInstall
 from dcc_mcp_aftereffects.install_service import LifecycleDependencies, run_lifecycle
 from dcc_mcp_aftereffects.runtime import AfterEffectsStatus
@@ -46,6 +50,49 @@ class BridgeRunner:
         if self.leak is not None:
             stdout += self.leak
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def _python_module_identities(tmp_path: Path) -> dict[str, object]:
+    root = tmp_path / "python-site"
+    raw: dict[str, object] = {}
+    for key, distribution, version, package in (
+        ("adapter", "dcc-mcp-aftereffects", "0.7.0", "dcc_mcp_aftereffects"),
+        ("core", "dcc-mcp-core", "0.20.21", "dcc_mcp_core"),
+        ("adobepy", "adobepy", "0.6.2", "adobe.after_effects"),
+    ):
+        relative = Path(*package.split(".")) / "__init__.py"
+        module = root / relative
+        module.parent.mkdir(parents=True, exist_ok=True)
+        contents = f"__version__ = {version!r}\n".encode()
+        module.write_bytes(contents)
+        normalized = distribution.replace("-", "_")
+        metadata = root / f"{normalized}-{version}.dist-info"
+        metadata.mkdir(parents=True)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(contents).digest()).decode().rstrip("=")
+        record = {
+            "path": relative.as_posix(),
+            "hash": f"sha256={digest}",
+            "size": len(contents),
+        }
+        (metadata / "METADATA").write_text(
+            f"Metadata-Version: 2.4\nName: {distribution}\nVersion: {version}\n",
+            encoding="utf-8",
+        )
+        (metadata / "RECORD").write_text(
+            f"{relative.as_posix()},sha256={digest},{len(contents)}\n",
+            encoding="utf-8",
+        )
+        raw[key] = {
+            "name": distribution,
+            "distribution": distribution,
+            "version": version,
+            "module_path": str(module.resolve()),
+            "distribution_root": str(root.resolve()),
+            "metadata_path": str(metadata.resolve()),
+            "records": [record],
+            "direct_url": None,
+        }
+    return capture_python_modules(raw)
 
 
 def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> ResolvedInstall:
@@ -117,6 +164,7 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
                 "version": "10.0.26100.1",
             },
         },
+        python_modules=_python_module_identities(tmp_path),
     )
 
 
