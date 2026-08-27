@@ -2528,6 +2528,7 @@ def test_uninstall_rejects_mutation_root_junction_without_removing_owned_state(
 
 
 @pytest.mark.parametrize("target", ["host", "signature-helper", "adapter-module"])
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows identity leases")
 def test_identity_change_inside_replace_boundary_has_zero_publish_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
@@ -2567,6 +2568,7 @@ def test_identity_change_inside_replace_boundary_has_zero_publish_rename(
 
 
 @pytest.mark.parametrize("target", ["host", "signature-helper", "adapter-module"])
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows identity leases")
 def test_identity_change_inside_receipt_replace_boundary_has_zero_publish_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
