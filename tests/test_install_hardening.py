@@ -550,14 +550,14 @@ def test_uninstall_receipt_failure_restores_exact_install(
     assert install_exit == EXIT_OK
     receipt_before = resolved.receipt_path.read_bytes()
     manifest_before = file_manifest(resolved.extension_path)
-    original_unlink = Path.unlink
+    original_delete = install_io._ExactObjectLease.delete
 
-    def fail_receipt_unlink(path: Path, *args, **kwargs):
-        if path == resolved.receipt_path:
+    def fail_receipt_delete(lease) -> None:
+        if lease.path == resolved.receipt_path:
             raise OSError("simulated receipt lock")
-        return original_unlink(path, *args, **kwargs)
+        original_delete(lease)
 
-    monkeypatch.setattr(Path, "unlink", fail_receipt_unlink)
+    monkeypatch.setattr(install_io._ExactObjectLease, "delete", fail_receipt_delete)
     report, exit_code = run_lifecycle(
         InstallRequest("uninstall", as_json=True, yes=True),
         resolved=resolved,
@@ -2237,14 +2237,18 @@ def test_locked_receipt_backup_cleanup_preserves_exact_prior_install(
         for path in resolved.extension_path.rglob("*")
         if path.is_file()
     }
-    original_unlink = Path.unlink
+    original_delete = install_io._ExactObjectLease.delete
 
-    def fail_receipt_backup_cleanup(path: Path, *args, **kwargs):
-        if path.name.startswith(f".{resolved.receipt_path.name}.backup-"):
+    def fail_receipt_backup_cleanup(lease) -> None:
+        if lease.path.name.startswith(f".{resolved.receipt_path.name}.backup-"):
             raise cleanup_failure
-        return original_unlink(path, *args, **kwargs)
+        original_delete(lease)
 
-    monkeypatch.setattr(Path, "unlink", fail_receipt_backup_cleanup)
+    monkeypatch.setattr(
+        install_io._ExactObjectLease,
+        "delete",
+        fail_receipt_backup_cleanup,
+    )
     report, exit_code = run_lifecycle(
         InstallRequest("upgrade", as_json=True, yes=True),
         resolved=resolved,
@@ -2847,3 +2851,236 @@ def test_non_windows_acquire_failure_has_no_dead_end_issue_view_remediation(
 
     _validator().validate(report)
     assert report["next_steps"] == []
+
+
+def _direct_transaction_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
+    destination = tmp_path / "CEP" / "dcc-mcp-aftereffects"
+    staged = tmp_path / "CEP" / ".dcc-mcp-aftereffects.stage"
+    receipt_path = tmp_path / "state" / "aftereffects-install.json"
+    destination.mkdir(parents=True)
+    staged.mkdir()
+    (destination / "manifest.xml").write_bytes(b"checked prior extension\n")
+    (staged / "manifest.xml").write_bytes(b"staged replacement\n")
+    prior_files = file_manifest(destination)
+    install_io.write_receipt(
+        receipt_path,
+        {
+            "dcc_type": "aftereffects",
+            "extension_path": str(destination),
+            "files": prior_files,
+            "manifest_sha256": install_io._manifest_digest(prior_files),
+        },
+    )
+    return staged, destination, receipt_path
+
+
+def _clone_object(source: Path, clone: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, clone)
+    else:
+        clone.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, clone)
+
+
+def _physical_object_id(path: Path) -> tuple[int, int, int]:
+    details = path.stat()
+    return int(details.st_dev), int(details.st_ino), int(details.st_mode)
+
+
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows exact-object leases")
+def test_commit_blocks_same_content_target_swap_immediately_before_backup(
+    tmp_path: Path, target: str
+) -> None:
+    staged, destination, receipt_path = _direct_transaction_paths(tmp_path)
+    selected = destination if target == "extension" else receipt_path
+    replacement = tmp_path / f"foreign-{target}"
+    preserved = tmp_path / f"checked-{target}"
+    _clone_object(selected, replacement)
+    attempted = False
+    blocked = False
+
+    def race_inside_attestation() -> bool:
+        nonlocal attempted, blocked
+        if attempted:
+            return True
+        attempted = True
+        try:
+            os.replace(selected, preserved)
+        except OSError as exc:
+            assert install_io._locked_error(exc)
+            blocked = True
+            return True
+        os.replace(replacement, selected)
+        return True
+
+    transaction = install_io.commit_staged_install(
+        staged=staged,
+        destination=destination,
+        receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+        receipt_path=receipt_path,
+        identity_attestor=race_inside_attestation,
+    )
+    transaction.finalize()
+
+    assert attempted is True
+    assert blocked is True
+    assert not preserved.exists()
+
+
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows exact-object leases")
+def test_transaction_blocks_same_content_backup_swap_before_finalize(
+    tmp_path: Path, target: str
+) -> None:
+    staged, destination, receipt_path = _direct_transaction_paths(tmp_path)
+    replacement = tmp_path / f"foreign-backup-{target}"
+    if target == "receipt":
+        _clone_object(receipt_path, replacement)
+    transaction = install_io.commit_staged_install(
+        staged=staged,
+        destination=destination,
+        receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+        receipt_path=receipt_path,
+    )
+    selected = transaction.backup if target == "extension" else transaction.receipt_backup
+    assert selected is not None
+    preserved = tmp_path / f"checked-backup-{target}"
+    if target == "extension":
+        _clone_object(selected, replacement)
+
+    with pytest.raises(OSError) as blocked:
+        os.replace(selected, preserved)
+
+    assert install_io._locked_error(blocked.value)
+    transaction.finalize()
+    assert not preserved.exists()
+
+
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows exact-object leases")
+def test_rollback_restores_the_checked_object_after_backup_swap_attempt(
+    tmp_path: Path, target: str
+) -> None:
+    staged, destination, receipt_path = _direct_transaction_paths(tmp_path)
+    checked = destination if target == "extension" else receipt_path
+    checked_identity = _physical_object_id(checked)
+    receipt_replacement = tmp_path / "foreign-rollback-receipt"
+    if target == "receipt":
+        _clone_object(receipt_path, receipt_replacement)
+    blocked = False
+
+    def fail_after_swap_attempt(path: Path, receipt) -> None:
+        nonlocal blocked
+        backup = next(destination.parent.glob(f".{destination.name}.backup-*"))
+        receipt_backup = next(receipt_path.parent.glob(f".{receipt_path.name}.backup-*"))
+        selected = backup if target == "extension" else receipt_backup
+        replacement = (
+            receipt_replacement if target == "receipt" else tmp_path / "foreign-rollback-extension"
+        )
+        preserved = tmp_path / f"checked-rollback-{target}"
+        if target == "extension":
+            _clone_object(selected, replacement)
+        try:
+            os.replace(selected, preserved)
+        except OSError as exc:
+            assert install_io._locked_error(exc)
+            blocked = True
+        else:
+            os.replace(replacement, selected)
+        raise RuntimeError("receipt callback failure after swap attempt")
+
+    with pytest.raises(install_io.ReceiptCallbackError, match="receipt callback failed"):
+        install_io.commit_staged_install(
+            staged=staged,
+            destination=destination,
+            receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+            receipt_path=receipt_path,
+            receipt_writer=fail_after_swap_attempt,
+        )
+
+    assert blocked is True
+    assert _physical_object_id(checked) == checked_identity
+
+
+@pytest.mark.parametrize(
+    ("phase", "target"),
+    [
+        ("recovery", "extension"),
+        ("recovery", "receipt"),
+        ("quarantine", "extension"),
+        ("quarantine", "receipt"),
+    ],
+)
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows exact-object leases")
+def test_uninstall_blocks_same_content_checked_object_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    target: str,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK, installed
+    receipt_replacement = tmp_path / f"foreign-uninstall-{phase}-receipt"
+    if target == "receipt":
+        _clone_object(resolved.receipt_path, receipt_replacement)
+    attempted = False
+    blocked = False
+
+    def attempt_swap(selected: Path) -> None:
+        nonlocal attempted, blocked
+        attempted = True
+        replacement = (
+            receipt_replacement
+            if target == "receipt"
+            else tmp_path / f"foreign-uninstall-{phase}-extension"
+        )
+        preserved = tmp_path / f"checked-uninstall-{phase}-{target}"
+        if target == "extension":
+            _clone_object(selected, replacement)
+        try:
+            os.replace(selected, preserved)
+        except OSError as exc:
+            assert install_io._locked_error(exc)
+            blocked = True
+        else:
+            os.replace(replacement, selected)
+
+    if phase == "recovery":
+        original_archive = install_io._write_recovery_archive
+
+        def racing_archive(source: Path, receipt, archive_path: Path) -> None:
+            if not attempted and source == resolved.extension_path:
+                attempt_swap(source if target == "extension" else resolved.receipt_path)
+            original_archive(source, receipt, archive_path)
+
+        monkeypatch.setattr(install_io, "_write_recovery_archive", racing_archive)
+    else:
+        original_cleanup = install_io.safe_remove_tree
+
+        def racing_cleanup(path: Path):
+            if not attempted and path.name.startswith(
+                f".{resolved.extension_path.name}.uninstall-"
+            ):
+                attempt_swap(path if target == "extension" else resolved.receipt_path)
+            return original_cleanup(path)
+
+        monkeypatch.setattr(install_io, "safe_remove_tree", racing_cleanup)
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("uninstall", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_OK, report
+    assert attempted is True
+    assert blocked is True
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
