@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -18,6 +19,7 @@ from .install_discovery import (
     host_process_executable,
     inspect_python_distributions,
     recapture_host_attestation,
+    recapture_python_modules,
 )
 from .install_io import (
     read_receipt,
@@ -216,9 +218,30 @@ def recapture_resolved_host(
     return current if current == expected else None
 
 
+def recapture_resolved_python(
+    resolved: ResolvedInstall,
+    dependencies: LifecycleDependencies,
+    *,
+    recapture: Callable[[Mapping[str, Any], Mapping[str, Any] | None], dict[str, Any] | None]
+    | None = None,
+) -> dict[str, Any] | None:
+    """Recapture exact target-interpreter distribution ownership before use."""
+    try:
+        expected = deepcopy(dict(resolved.python_modules))
+        if not expected:
+            return None
+        observed = dependencies.python_distribution_probe(resolved.python_path, deepcopy(expected))
+        capture = recapture if recapture is not None else recapture_python_modules
+        return capture(expected, observed)
+    except BaseException:
+        return None
+
+
 def installation_state(
     resolved: ResolvedInstall,
     receipt_override: Mapping[str, Any] | None = None,
+    *,
+    require_current_python: bool = False,
 ) -> tuple[str, dict[str, Any] | None]:
     receipt = (
         dict(receipt_override)
@@ -259,6 +282,11 @@ def installation_state(
             and receipt.get("bridge") != dict(resolved.bridge_identity)
         )
         or not receipt_files_match(receipt, resolved.extension_path)
+    ):
+        return "partial", receipt
+    if require_current_python and (
+        not resolved.python_modules
+        or receipt.get("python_modules") != dict(resolved.python_modules)
     ):
         return "partial", receipt
     return "installed", receipt
@@ -442,7 +470,11 @@ def verify_install(
     receipt_override: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int]:
     host_identity = recapture_resolved_host(resolved, dependencies)
-    state, _receipt = installation_state(resolved, receipt_override)
+    state, _receipt = installation_state(
+        resolved,
+        receipt_override,
+        require_current_python=True,
+    )
     steps = [{"id": "receipt", "status": "ok" if state == "installed" else "failed"}]
     if host_identity is None:
         reason = "The signed After Effects host identity could not be recaptured exactly"
@@ -474,6 +506,23 @@ def verify_install(
             EXIT_VERIFY,
         )
     steps.append({"id": "host-attestation", "status": "ok"})
+    python_modules = recapture_resolved_python(resolved, dependencies)
+    if python_modules is None:
+        reason = "The target Python package identities could not be recaptured exactly"
+        steps.append({"id": "python-attestation", "status": "failed", "message": reason})
+        return (
+            build_report(
+                resolved,
+                status="failed",
+                state=state,
+                steps=steps,
+                failure_stage="python_attestation",
+                failure_reason=reason,
+                next_steps=[],
+            ),
+            EXIT_VERIFY,
+        )
+    steps.append({"id": "python-attestation", "status": "ok"})
     import_ok, import_reason = dependencies.import_probe(resolved.python_path)
     steps.append(
         {
@@ -553,5 +602,6 @@ __all__ = [
     "LifecycleDependencies",
     "installation_state",
     "recapture_resolved_host",
+    "recapture_resolved_python",
     "verify_install",
 ]

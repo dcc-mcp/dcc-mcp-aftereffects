@@ -30,6 +30,7 @@ from .install_io import (
     InstallIoError,
     RestartRequired,
     RollbackError,
+    acquire_staging,
     commit_staged_install,
     create_staging_dir,
     file_manifest,
@@ -52,6 +53,7 @@ from .install_verification import (
     LifecycleDependencies,
     installation_state,
     recapture_resolved_host,
+    recapture_resolved_python,
     verify_install,
 )
 
@@ -118,15 +120,29 @@ def _transaction_failure(
     return report, EXIT_INSTALL
 
 
+def _rollback_callback_failure(primary: BaseException, transaction: Any) -> None:
+    try:
+        transaction.rollback()
+    except BaseException:
+        try:
+            primary.rollback_failed = True
+        except (AttributeError, TypeError):
+            pass
+    else:
+        try:
+            primary.previous_install_restored = True
+        except (AttributeError, TypeError):
+            pass
+
+
 def _recapture_resolved_python(
     resolved: ResolvedInstall, dependencies: LifecycleDependencies
 ) -> dict[str, Any] | None:
-    try:
-        expected = deepcopy(dict(resolved.python_modules))
-        observed = dependencies.python_distribution_probe(resolved.python_path, deepcopy(expected))
-        return recapture_python_modules(expected, observed)
-    except BaseException:
-        return None
+    return recapture_resolved_python(
+        resolved,
+        dependencies,
+        recapture=recapture_python_modules,
+    )
 
 
 def _recapture_resolved_mutation_roots(resolved: ResolvedInstall) -> dict[str, Any] | None:
@@ -197,6 +213,27 @@ def _attested_identity_paths(resolved: ResolvedInstall) -> tuple[Path, ...]:
 
 def _attested_mutation_root_paths(resolved: ResolvedInstall) -> tuple[Path, ...]:
     return _physical_identity_paths(dict(resolved.mutation_roots))
+
+
+def _blocked_mutation_root_change(exc: BaseException, resolved: ResolvedInstall) -> bool:
+    roots = {
+        os.path.normcase(str(path.absolute())) for path in _attested_mutation_root_paths(resolved)
+    }
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, OSError):
+            paths = {
+                os.path.normcase(str(Path(value).absolute()))
+                for value in (
+                    getattr(current, "filename", None),
+                    getattr(current, "filename2", None),
+                )
+                if value
+            }
+            if paths & roots:
+                return True
+        current = current.__cause__
+    return False
 
 
 def _require_exact_install_attestations(
@@ -386,6 +423,7 @@ def _install_or_upgrade(
             before_mutation=lambda: _require_exact_install_attestations(resolved, dependencies),
             identity_paths=_attested_identity_paths(resolved),
         )
+        staging_lease = acquire_staging(staged)
     except IdentityAttestationError as exc:
         reason = str(exc)
         return (
@@ -417,15 +455,23 @@ def _install_or_upgrade(
             EXIT_PREFLIGHT,
         )
     try:
-        run_adobepy_install_bridge(
-            cli=resolved.adobepy_cli,
-            expected_identity=resolved.bridge_identity,
-            destination=staged,
-            token=resolved.token,
-            broker_url=resolved.broker_url,
-            target=resolved.target,
-            runner=dependencies.bridge_runner,
-        )
+        try:
+            run_adobepy_install_bridge(
+                cli=resolved.adobepy_cli,
+                expected_identity=resolved.bridge_identity,
+                destination=staged,
+                token=resolved.token,
+                broker_url=resolved.broker_url,
+                target=resolved.target,
+                runner=dependencies.bridge_runner,
+            )
+        except InstallIoError as exc:
+            if _blocked_mutation_root_change(exc, resolved):
+                raise IdentityAttestationError(
+                    "The extension or receipt mutation roots could not be recaptured exactly",
+                    stage="mutation_roots",
+                ) from exc
+            raise
         steps[1]["status"] = "ok"
         try:
             resolved = _require_exact_install_attestations(resolved, dependencies)
@@ -463,6 +509,8 @@ def _install_or_upgrade(
             "target": resolved.target,
             "installed_at": datetime.now(timezone.utc).isoformat(),
         }
+        committed_staging_lease = staging_lease
+        staging_lease = None
         transaction = commit_staged_install(
             staged=staged,
             destination=resolved.extension_path,
@@ -475,6 +523,7 @@ def _install_or_upgrade(
             identity_paths=_attested_identity_paths(resolved),
             mutation_root_attestor=lambda: _recapture_resolved_mutation_roots(resolved) is not None,
             mutation_root_paths=_attested_mutation_root_paths(resolved),
+            staged_lease=committed_staging_lease,
         )
         steps[2]["status"] = "ok"
         steps[3]["status"] = "ok"
@@ -544,14 +593,21 @@ def _install_or_upgrade(
             report["rollback_failed"] = True
         return report, EXIT_INSTALL
     finally:
-        remove_staging(staged)
-
-    verify_report, verify_exit = verify_install(
-        request,
-        resolved,
-        dependencies,
-        receipt_override=transaction.committed_receipt(),
-    )
+        if staging_lease is not None:
+            try:
+                remove_staging(staging_lease)
+            except BaseException:
+                pass
+    try:
+        verify_report, verify_exit = verify_install(
+            request,
+            resolved,
+            dependencies,
+            receipt_override=transaction.committed_receipt(),
+        )
+    except BaseException as exc:
+        _rollback_callback_failure(exc, transaction)
+        raise
     steps[4]["status"] = "ok" if verify_exit == EXIT_OK else "failed"
     combined_steps = steps + verify_report["steps"]
     if verify_exit == EXIT_OK:
@@ -600,6 +656,22 @@ def _install_or_upgrade(
             verify_exit,
         )
     reason = verify_report["verify"]["failure_reason"] or "After Effects must load the CEP bridge"
+    failure_stage = verify_report["verify"].get("failure_stage")
+    if failure_stage in {
+        "host_attestation",
+        "identity_attestation",
+        "mutation_roots",
+        "python_attestation",
+    }:
+        return _identity_attestation_failure(
+            resolved,
+            state=state,
+            steps=combined_steps,
+            mode=mode,
+            failure_stage=failure_stage,
+            reason=reason,
+            transaction=transaction,
+        )
     if request.command == "upgrade" and transaction.moved_existing:
         rollback_failed = False
         try:
@@ -621,7 +693,6 @@ def _install_or_upgrade(
         else:
             report["previous_install_restored"] = True
         return report, verify_exit
-    failure_stage = verify_report["verify"].get("failure_stage")
     if failure_stage != "readiness":
         rollback_failed = False
         try:
@@ -894,6 +965,10 @@ def run_lifecycle(
                 "error_type": error_type,
             },
         }
+        if getattr(exc, "rollback_failed", False):
+            report["rollback_failed"] = True
+        elif getattr(exc, "previous_install_restored", False):
+            report["previous_install_restored"] = True
         return report, EXIT_INSTALL
 
 
