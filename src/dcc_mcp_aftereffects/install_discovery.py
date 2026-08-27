@@ -161,9 +161,11 @@ def _windows_directory() -> Path | None:
 
 
 def _win_verify_trust(path: Path) -> bool:
-    """Use WinVerifyTrust directly before trusting PowerShell signature output."""
+    """Verify an embedded or Windows catalog signature without executing the file."""
     if os.name != "nt":
         return False
+
+    import msvcrt
 
     class GUID(ctypes.Structure):
         _fields_ = [
@@ -189,7 +191,7 @@ def _win_verify_trust(path: Path) -> bool:
             ("dwUIChoice", ctypes.c_ulong),
             ("fdwRevocationChecks", ctypes.c_ulong),
             ("dwUnionChoice", ctypes.c_ulong),
-            ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
+            ("pInfo", ctypes.c_void_p),
             ("dwStateAction", ctypes.c_ulong),
             ("hWVTStateData", ctypes.c_void_p),
             ("pwszURLReference", ctypes.c_wchar_p),
@@ -198,35 +200,149 @@ def _win_verify_trust(path: Path) -> bool:
             ("pSignatureSettings", ctypes.c_void_p),
         ]
 
+    class WINTRUST_CATALOG_INFO(ctypes.Structure):
+        _fields_ = [
+            ("cbStruct", ctypes.c_ulong),
+            ("dwCatalogVersion", ctypes.c_ulong),
+            ("pcwszCatalogFilePath", ctypes.c_wchar_p),
+            ("pcwszMemberTag", ctypes.c_wchar_p),
+            ("pcwszMemberFilePath", ctypes.c_wchar_p),
+            ("hMemberFile", ctypes.c_void_p),
+            ("pbCalculatedFileHash", ctypes.POINTER(ctypes.c_ubyte)),
+            ("cbCalculatedFileHash", ctypes.c_ulong),
+            ("pcCatalogContext", ctypes.c_void_p),
+            ("hCatAdmin", ctypes.c_void_p),
+        ]
+
+    class CATALOG_INFO(ctypes.Structure):
+        _fields_ = [
+            ("cbStruct", ctypes.c_ulong),
+            ("wszCatalogFile", ctypes.c_wchar * 260),
+        ]
+
     action = GUID(
         0x00AAC56B,
         0xCD44,
         0x11D0,
         (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE),
     )
-    file_info = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), str(path), None, None)
-    trust_data = WINTRUST_DATA(
-        ctypes.sizeof(WINTRUST_DATA),
-        None,
-        None,
-        2,
-        0,
-        1,
-        ctypes.pointer(file_info),
-        0,
-        None,
-        None,
-        0x00001000,
-        0,
-        None,
-    )
-    try:
-        return (
-            ctypes.windll.wintrust.WinVerifyTrust(
-                None, ctypes.byref(action), ctypes.byref(trust_data)
-            )
-            == 0
+    wintrust = ctypes.windll.wintrust
+    wintrust.WinVerifyTrust.restype = ctypes.c_long
+    wintrust.WinVerifyTrust.argtypes = [ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.c_void_p]
+
+    def verify(choice: int, info: ctypes.c_void_p) -> bool:
+        trust_data = WINTRUST_DATA(
+            ctypes.sizeof(WINTRUST_DATA),
+            None,
+            None,
+            2,
+            0,
+            choice,
+            info,
+            0,
+            None,
+            None,
+            0x00001000,
+            0,
+            None,
         )
+        return wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(trust_data)) == 0
+
+    try:
+        file_info = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), str(path), None, None)
+        if verify(1, ctypes.cast(ctypes.pointer(file_info), ctypes.c_void_p)):
+            return True
+
+        catalog_api = ctypes.windll.wintrust
+        catalog_api.CryptCATAdminAcquireContext2.restype = ctypes.c_bool
+        catalog_api.CryptCATAdminAcquireContext2.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        catalog_api.CryptCATAdminCalcHashFromFileHandle2.restype = ctypes.c_bool
+        catalog_api.CryptCATAdminCalcHashFromFileHandle2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_ulong,
+        ]
+        catalog_api.CryptCATAdminEnumCatalogFromHash.restype = ctypes.c_void_p
+        catalog_api.CryptCATAdminEnumCatalogFromHash.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        catalog_api.CryptCATCatalogInfoFromContext.restype = ctypes.c_bool
+        catalog_api.CryptCATCatalogInfoFromContext.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(CATALOG_INFO),
+            ctypes.c_ulong,
+        ]
+        catalog_api.CryptCATAdminReleaseCatalogContext.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        catalog_api.CryptCATAdminReleaseContext.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        catalog_admin = ctypes.c_void_p()
+        if not catalog_api.CryptCATAdminAcquireContext2(
+            ctypes.byref(catalog_admin), None, "SHA256", None, 0
+        ):
+            return False
+        try:
+            with path.open("rb") as stream:
+                native_handle = ctypes.c_void_p(msvcrt.get_osfhandle(stream.fileno()))
+                hash_size = ctypes.c_ulong()
+                if not catalog_api.CryptCATAdminCalcHashFromFileHandle2(
+                    catalog_admin, native_handle, ctypes.byref(hash_size), None, 0
+                ):
+                    return False
+                file_hash = (ctypes.c_ubyte * hash_size.value)()
+                if not catalog_api.CryptCATAdminCalcHashFromFileHandle2(
+                    catalog_admin,
+                    native_handle,
+                    ctypes.byref(hash_size),
+                    file_hash,
+                    0,
+                ):
+                    return False
+                catalog_context = catalog_api.CryptCATAdminEnumCatalogFromHash(
+                    catalog_admin, file_hash, hash_size.value, 0, None
+                )
+                if not catalog_context:
+                    return False
+                try:
+                    catalog = CATALOG_INFO(ctypes.sizeof(CATALOG_INFO))
+                    if not catalog_api.CryptCATCatalogInfoFromContext(
+                        catalog_context, ctypes.byref(catalog), 0
+                    ):
+                        return False
+                    member_tag = bytes(file_hash).hex().upper()
+                    catalog_info = WINTRUST_CATALOG_INFO(
+                        ctypes.sizeof(WINTRUST_CATALOG_INFO),
+                        0,
+                        catalog.wszCatalogFile,
+                        member_tag,
+                        str(path),
+                        native_handle,
+                        file_hash,
+                        hash_size.value,
+                        None,
+                        catalog_admin,
+                    )
+                    return verify(2, ctypes.cast(ctypes.pointer(catalog_info), ctypes.c_void_p))
+                finally:
+                    catalog_api.CryptCATAdminReleaseCatalogContext(
+                        catalog_admin, catalog_context, 0
+                    )
+        finally:
+            catalog_api.CryptCATAdminReleaseContext(catalog_admin, 0)
     except (AttributeError, OSError):
         return False
 
@@ -276,11 +392,14 @@ def _verified_host_evidence(
                 flags=re.IGNORECASE,
             )
             is None
-            or re.search(
-                r"Windows PowerShell", str(payload.get("helperProduct", "")), re.IGNORECASE
+            or re.fullmatch(
+                r"(?:Windows PowerShell|Microsoft(?:®|\(R\))? Windows(?:®|\(R\))? Operating System)",
+                str(payload.get("helperProduct", "")),
+                re.IGNORECASE,
             )
             is None
-            or str(payload.get("helperOriginal", "")).casefold() != "powershell.exe"
+            or str(payload.get("helperOriginal", "")).casefold()
+            not in {"powershell.exe", "powershell.exe.mui"}
             or payload.get("status") != "Valid"
             or re.search(
                 r"(?:^|,)\s*CN=Adobe (?:Inc\.?|Systems Incorporated)(?:,|$)",
@@ -359,15 +478,29 @@ def trusted_host_attestation(
     else:
         helper = helper_path
         helper_identity = _stable_file_identity(helper, 128 * 1024 * 1024)
-        if helper_identity is None:
+        if helper_identity is None or (platform == "win32" and not _win_verify_trust(helper)):
             return None
     host_identity = _stable_file_identity(_host_binary(path, platform), 2_147_483_647)
     if host_identity is None:
+        return None
+    if platform == "win32" and not _win_verify_trust(helper):
+        return None
+    execution_helper_identity = _stable_file_identity(helper, 128 * 1024 * 1024)
+    execution_host_identity = _stable_file_identity(_host_binary(path, platform), 2_147_483_647)
+    if execution_helper_identity != helper_identity or execution_host_identity != host_identity:
         return None
     evidence = _verified_host_evidence(path, platform, helper)
     if evidence is None:
         return None
     version, helper_metadata = evidence
+    final_helper_identity = _stable_file_identity(helper, 128 * 1024 * 1024)
+    final_host_identity = _stable_file_identity(_host_binary(path, platform), 2_147_483_647)
+    if (
+        final_helper_identity != helper_identity
+        or final_host_identity != host_identity
+        or (platform == "win32" and not _win_verify_trust(helper))
+    ):
+        return None
     try:
         _version_key(version)
     except PreflightError:
@@ -375,8 +508,8 @@ def trusted_host_attestation(
     return {
         "platform": platform,
         "version": version,
-        "host": host_identity,
-        "signature_helper": {**helper_identity, **helper_metadata},
+        "host": final_host_identity,
+        "signature_helper": {**final_helper_identity, **helper_metadata},
     }
 
 
