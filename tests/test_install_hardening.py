@@ -281,6 +281,116 @@ def test_host_path_drift_fails_before_any_signature_helper_process(
     assert calls == []
 
 
+@pytest.mark.parametrize("target", ["host", "signature-helper"])
+@pytest.mark.parametrize("drift", ["same-bytes", "hardlink", "link-or-reparse"])
+def test_host_or_signature_helper_physical_drift_has_zero_install_mutation(
+    tmp_path: Path, target: str, drift: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    host = resolved.host_path
+    helper = Path(resolved.host_identity["signature_helper"]["path"])
+    expected = deepcopy(dict(resolved.host_identity))
+    expected["host"] = install_discovery._stable_file_identity(host, 2_147_483_647)
+    helper_metadata = {
+        key: value
+        for key, value in expected["signature_helper"].items()
+        if key not in {"path", "bytes", "sha256", "physical"}
+    }
+    expected["signature_helper"] = {
+        **install_discovery._stable_file_identity(helper, 128 * 1024 * 1024),
+        **helper_metadata,
+    }
+    resolved = replace(resolved, host_identity=expected)
+    selected = host if target == "host" else helper
+    if drift == "same-bytes":
+        replacement = selected.with_suffix(".same-byte-replacement")
+        replacement.write_bytes(selected.read_bytes())
+        os.replace(replacement, selected)
+    elif drift == "hardlink":
+        foreign = selected.with_suffix(".hardlink-source")
+        foreign.write_bytes(selected.read_bytes())
+        selected.unlink()
+        os.link(foreign, selected)
+    else:
+        original_parent = selected.parent
+        foreign_parent = original_parent.with_name(f"{original_parent.name}-foreign")
+        original_parent.rename(foreign_parent)
+        if os.name == "nt":
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(original_parent), str(foreign_parent)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert linked.returncode == 0, linked.stderr
+        else:
+            original_parent.symlink_to(foreign_parent, target_is_directory=True)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+
+    def host_probe(_path: Path, captured):
+        host_identity = install_discovery._stable_file_identity(host, 2_147_483_647)
+        helper_identity = install_discovery._stable_file_identity(helper, 128 * 1024 * 1024)
+        if host_identity is None or helper_identity is None:
+            return None
+        observed = deepcopy(dict(captured))
+        observed["host"] = host_identity
+        observed["signature_helper"] = {
+            **helper_identity,
+            **helper_metadata,
+        }
+        return observed
+
+    dependencies.host_attestation_probe = host_probe
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "host_attestation"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+def test_host_drift_after_bridge_has_zero_extension_or_receipt_mutation(
+    tmp_path: Path,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    expected = deepcopy(dict(resolved.host_identity))
+    drifted = deepcopy(expected)
+    drifted["host"]["sha256"] = "0" * 64
+    drift = False
+    base_runner = BridgeRunner()
+
+    def runner(*args, **kwargs):
+        nonlocal drift
+        result = base_runner(*args, **kwargs)
+        drift = True
+        return result
+
+    dependencies = healthy_dependencies(base_runner)
+    dependencies.bridge_runner = runner
+    dependencies.host_attestation_probe = lambda _path, _expected: deepcopy(
+        drifted if drift else expected
+    )
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "host_attestation"
+    assert len(base_runner.calls) == 1
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows catalog trust APIs")
 def test_native_windows_catalog_signed_powershell_is_trusted_without_environment() -> None:
     helper = install_discovery._signature_helper(
@@ -1323,10 +1433,49 @@ def test_target_interpreter_distribution_semantics_must_match_before_mutation(
                 "distribution_root": identity["distribution_root"],
                 "metadata_path": identity["metadata_path"],
                 "direct_url": None,
+                "records": [identity["record"]] if identity["record"] is not None else [],
             }
         return observed
 
     dependencies.python_distribution_probe = foreign_distribution
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+def test_target_interpreter_duplicate_record_owner_has_zero_install_mutation(
+    tmp_path: Path,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+
+    def duplicate_record_owner(_python: Path, expected):
+        observed = {}
+        for key, identity in expected.items():
+            record = identity["record"]
+            observed[key] = {
+                "name": identity["metadata_name"],
+                "distribution": identity["distribution"],
+                "version": identity["version"],
+                "module_path": identity["module_path"],
+                "distribution_root": identity["distribution_root"],
+                "metadata_path": identity["metadata_path"],
+                "direct_url": None,
+                "records": [record, record] if key == "adapter" else [record],
+            }
+        return observed
+
+    dependencies.python_distribution_probe = duplicate_record_owner
 
     report, exit_code = run_lifecycle(
         InstallRequest("install", as_json=True, yes=True),
@@ -1819,6 +1968,151 @@ def test_bridge_cli_is_rehashed_immediately_before_external_execution(
     assert exit_code == EXIT_INSTALL
     assert report["verify"]["failure_stage"] == "install"
     assert runner.calls == []
+
+
+@pytest.mark.parametrize("target", ["cli", "manifest"])
+@pytest.mark.parametrize("drift", ["same-bytes", "hardlink", "link-or-reparse"])
+def test_bridge_physical_drift_has_zero_external_execution(
+    tmp_path: Path, target: str, drift: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    cli = resolved.adobepy_cli
+    assert cli is not None
+    manifest = Path(resolved.bridge_identity["manifest_path"])
+    cli_identity = install_discovery._stable_file_identity(cli, 2_147_483_647)
+    manifest_identity = install_discovery._stable_file_identity(manifest, 65_536)
+    assert cli_identity is not None and manifest_identity is not None
+    bridge_identity = {
+        **dict(resolved.bridge_identity),
+        "physical": cli_identity["physical"],
+        "manifest_physical": manifest_identity["physical"],
+    }
+    resolved = replace(resolved, bridge_identity=bridge_identity)
+    selected = cli if target == "cli" else manifest
+    if drift == "same-bytes":
+        replacement = selected.with_suffix(".same-byte-replacement")
+        replacement.write_bytes(selected.read_bytes())
+        os.replace(replacement, selected)
+    elif drift == "hardlink":
+        foreign = selected.with_suffix(".hardlink-source")
+        foreign.write_bytes(selected.read_bytes())
+        selected.unlink()
+        os.link(foreign, selected)
+    else:
+        original_parent = selected.parent
+        foreign_parent = original_parent.with_name(f"{original_parent.name}-foreign")
+        original_parent.rename(foreign_parent)
+        if os.name == "nt":
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(original_parent), str(foreign_parent)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert linked.returncode == 0, linked.stderr
+        else:
+            original_parent.symlink_to(foreign_parent, target_is_directory=True)
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["verify"]["failure_stage"] == "install"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+def test_finalize_cleanup_failure_restores_exact_prior_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    previous_receipt = resolved.receipt_path.read_bytes()
+    previous_files = {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    }
+
+    def cleanup_failure(_transaction):
+        raise install_io.RestartRequired("simulated verified-backup cleanup failure")
+
+    monkeypatch.setattr(install_io.InstallTransaction, "finalize", cleanup_failure)
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "cleanup"
+    assert resolved.receipt_path.read_bytes() == previous_receipt
+    assert {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    } == previous_files
+    assert not list(
+        resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.backup-*")
+    )
+
+
+def test_partial_finalize_cleanup_restores_prior_install_from_recovery_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    previous_receipt = resolved.receipt_path.read_bytes()
+    previous_files = {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    }
+    original_remove = install_io.safe_remove_tree
+    failed_once = False
+
+    def partial_backup_cleanup(path: Path):
+        nonlocal failed_once
+        if not failed_once and path.name.startswith(f".{resolved.extension_path.name}.backup-"):
+            failed_once = True
+            victim = path / "manifest.xml"
+            victim.unlink(missing_ok=True)
+            return {"success": False, "errors": ["simulated partial cleanup"]}
+        return original_remove(path)
+
+    monkeypatch.setattr(install_io, "safe_remove_tree", partial_backup_cleanup)
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "cleanup"
+    assert report.get("rollback_failed") is not True
+    assert resolved.receipt_path.read_bytes() == previous_receipt
+    assert {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    } == previous_files
 
 
 def test_macos_bundle_identity_binds_the_inner_after_effects_process(tmp_path: Path) -> None:

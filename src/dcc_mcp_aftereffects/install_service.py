@@ -48,15 +48,16 @@ from .install_verification import (
 )
 
 
-def _python_attestation_failure(
+def _identity_attestation_failure(
     resolved: ResolvedInstall,
     *,
     state: str,
     steps: list[dict[str, Any]],
     mode: str,
+    failure_stage: str,
+    reason: str,
     transaction: Any | None = None,
 ) -> tuple[dict[str, Any], int]:
-    reason = "The target Python package identities could not be recaptured exactly"
     rollback_failed = False
     if transaction is not None:
         try:
@@ -69,13 +70,44 @@ def _python_attestation_failure(
         state=installation_state(resolved)[0] if transaction is not None else state,
         steps=steps,
         mode=mode,
-        failure_stage="python_attestation",
+        failure_stage=failure_stage,
         failure_reason=reason,
         next_steps=[],
     )
     if rollback_failed:
         report["rollback_failed"] = True
     return report, EXIT_PREFLIGHT
+
+
+def _transaction_failure(
+    resolved: ResolvedInstall,
+    *,
+    steps: list[dict[str, Any]],
+    mode: str,
+    failure_stage: str,
+    reason: str,
+    transaction: Any,
+) -> tuple[dict[str, Any], int]:
+    rollback_failed = False
+    try:
+        transaction.rollback()
+    except BaseException:
+        rollback_failed = True
+    report = build_report(
+        resolved,
+        status="failed",
+        state=installation_state(resolved)[0],
+        steps=steps,
+        mode=mode,
+        failure_stage=failure_stage,
+        failure_reason=reason,
+        next_steps=[],
+    )
+    if rollback_failed:
+        report["rollback_failed"] = True
+    else:
+        report["previous_install_restored"] = True
+    return report, EXIT_INSTALL
 
 
 def _recapture_resolved_python(
@@ -87,6 +119,31 @@ def _recapture_resolved_python(
         return recapture_python_modules(expected, observed)
     except BaseException:
         return None
+
+
+def _require_exact_install_attestations(
+    resolved: ResolvedInstall, dependencies: LifecycleDependencies
+) -> ResolvedInstall:
+    try:
+        host_identity = recapture_resolved_host(resolved, dependencies)
+    except BaseException:
+        host_identity = None
+    if host_identity is None:
+        raise IdentityAttestationError(
+            "The signed After Effects host identity could not be recaptured exactly",
+            stage="host_attestation",
+        )
+    python_modules = _recapture_resolved_python(resolved, dependencies)
+    if python_modules is None:
+        raise IdentityAttestationError(
+            "The target Python package identities could not be recaptured exactly",
+            stage="python_attestation",
+        )
+    return replace(
+        resolved,
+        host_identity=host_identity,
+        python_modules=python_modules,
+    )
 
 
 def _install_or_upgrade(
@@ -223,9 +280,10 @@ def _install_or_upgrade(
             runner=dependencies.bridge_runner,
         )
         steps[1]["status"] = "ok"
-        python_modules = _recapture_resolved_python(resolved, dependencies)
-        if python_modules is None:
-            reason = "The target Python package identities could not be recaptured exactly"
+        try:
+            resolved = _require_exact_install_attestations(resolved, dependencies)
+        except IdentityAttestationError as exc:
+            reason = str(exc)
             steps[2] = {"id": "commit-extension", "status": "failed", "message": reason}
             return (
                 build_report(
@@ -234,13 +292,12 @@ def _install_or_upgrade(
                     state=state,
                     steps=steps,
                     mode=mode,
-                    failure_stage="python_attestation",
+                    failure_stage=exc.stage,
                     failure_reason=reason,
                     next_steps=[],
                 ),
                 EXIT_PREFLIGHT,
             )
-        resolved = replace(resolved, python_modules=python_modules)
         receipt_payload = {
             "schema_version": SCHEMA_VERSION,
             "dcc_type": "aftereffects",
@@ -265,25 +322,28 @@ def _install_or_upgrade(
             receipt=receipt_payload,
             receipt_path=resolved.receipt_path,
             receipt_writer=dependencies.receipt_writer,
-            identity_attestor=lambda: (
-                _recapture_resolved_python(resolved, dependencies) is not None
+            identity_attestor=lambda: bool(
+                _require_exact_install_attestations(resolved, dependencies)
             ),
         )
         steps[2]["status"] = "ok"
         steps[3]["status"] = "ok"
     except IdentityAttestationError as exc:
         reason = str(exc)
+        report = build_report(
+            resolved,
+            status="failed",
+            state=installation_state(resolved)[0],
+            steps=steps,
+            mode=mode,
+            failure_stage=exc.stage,
+            failure_reason=reason,
+            next_steps=[],
+        )
+        if exc.rollback_failed:
+            report["rollback_failed"] = True
         return (
-            build_report(
-                resolved,
-                status="failed",
-                state=installation_state(resolved)[0],
-                steps=steps,
-                mode=mode,
-                failure_stage="python_attestation",
-                failure_reason=reason,
-                next_steps=[],
-            ),
+            report,
             EXIT_PREFLIGHT,
         )
     except RestartRequired as exc:
@@ -340,32 +400,28 @@ def _install_or_upgrade(
     steps[4]["status"] = "ok" if verify_exit == EXIT_OK else "failed"
     combined_steps = steps + verify_report["steps"]
     if verify_exit == EXIT_OK:
-        python_modules = _recapture_resolved_python(resolved, dependencies)
-        if python_modules is None:
-            return _python_attestation_failure(
+        try:
+            resolved = _require_exact_install_attestations(resolved, dependencies)
+        except IdentityAttestationError as exc:
+            return _identity_attestation_failure(
                 resolved,
                 state=state,
                 steps=combined_steps,
                 mode=mode,
+                failure_stage=exc.stage,
+                reason=str(exc),
                 transaction=transaction,
             )
-        resolved = replace(resolved, python_modules=python_modules)
         try:
             transaction.finalize()
         except RestartRequired as exc:
-            reason = str(exc)
-            return (
-                build_report(
-                    resolved,
-                    status="requires_restart",
-                    state="installed",
-                    steps=combined_steps,
-                    mode=mode,
-                    failure_stage="cleanup",
-                    failure_reason=reason,
-                    next_steps=[next_step(retry_command(request), reason, "retry-cleanup")],
-                ),
-                EXIT_REQUIRES_RESTART,
+            return _transaction_failure(
+                resolved,
+                steps=combined_steps,
+                mode=mode,
+                failure_stage="cleanup",
+                reason=str(exc),
+                transaction=transaction,
             )
         return (
             build_report(
@@ -411,19 +467,28 @@ def _install_or_upgrade(
             verify_report["rollback_failed"] = True
         return verify_report, verify_exit
     try:
-        python_modules = _recapture_resolved_python(resolved, dependencies)
-        if python_modules is None:
-            return _python_attestation_failure(
-                resolved,
-                state=state,
-                steps=combined_steps,
-                mode=mode,
-                transaction=transaction,
-            )
-        resolved = replace(resolved, python_modules=python_modules)
+        resolved = _require_exact_install_attestations(resolved, dependencies)
+    except IdentityAttestationError as exc:
+        return _identity_attestation_failure(
+            resolved,
+            state=state,
+            steps=combined_steps,
+            mode=mode,
+            failure_stage=exc.stage,
+            reason=str(exc),
+            transaction=transaction,
+        )
+    try:
         transaction.finalize()
     except RestartRequired as exc:
-        reason = str(exc)
+        return _transaction_failure(
+            resolved,
+            steps=combined_steps,
+            mode=mode,
+            failure_stage="cleanup",
+            reason=str(exc),
+            transaction=transaction,
+        )
     return (
         build_report(
             resolved,
