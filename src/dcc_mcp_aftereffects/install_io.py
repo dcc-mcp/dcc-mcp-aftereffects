@@ -44,6 +44,12 @@ class IdentityAttestationError(InstallIoError):
         self.rollback_failed = False
 
 
+class ReceiptCallbackError(InstallIoError):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.rollback_failed = False
+
+
 def _redact(value: str, secret: str | None) -> str:
     if secret:
         return value.replace(secret, "<redacted>")
@@ -363,9 +369,16 @@ def _locked_error(exc: OSError) -> bool:
     return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33}
 
 
-def _replace_with_retry(source: Path, destination: Path) -> None:
+def _replace_with_retry(
+    source: Path,
+    destination: Path,
+    *,
+    before_mutation: Callable[[], None] | None = None,
+) -> None:
     for attempt in range(3):
         try:
+            if before_mutation is not None:
+                before_mutation()
             os.replace(source, destination)
             return
         except OSError:
@@ -391,7 +404,9 @@ class InstallTransaction:
     receipt_path: Path
     old_receipt: bytes | None
     old_receipt_valid: bool
+    receipt_backup: Path | None = None
     moved_existing: bool = False
+    moved_receipt: bool = False
     committed_new: bool = False
     closed: bool = False
     recovery_archive: Path | None = None
@@ -424,10 +439,12 @@ class InstallTransaction:
                     )
                 else:
                     raise OSError("previous After Effects extension backup is unavailable")
-            if self.old_receipt is None:
+            if self.moved_receipt:
+                if self.receipt_backup is None or not self.receipt_backup.exists():
+                    raise OSError("previous After Effects receipt backup is unavailable")
+                _replace_with_retry(self.receipt_backup, self.receipt_path)
+            elif self.old_receipt is None:
                 self.receipt_path.unlink(missing_ok=True)
-            else:
-                _write_receipt_bytes(self.receipt_path, self.old_receipt)
             if self.old_receipt_valid:
                 restored = read_receipt(self.receipt_path)
                 if restored is None or not receipt_files_match(restored, self.destination):
@@ -443,6 +460,8 @@ class InstallTransaction:
                     self.recovery_archive.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if self.closed and self.receipt_backup is not None:
+                self.receipt_backup.unlink(missing_ok=True)
 
     def finalize(self) -> None:
         if self.closed:
@@ -477,6 +496,13 @@ class InstallTransaction:
                     "The previous extension recovery snapshot could not be cleaned safely"
                 ) from exc
             self.recovery_archive = None
+        if self.receipt_backup is not None and self.receipt_backup.exists():
+            try:
+                self.receipt_backup.unlink()
+            except OSError as exc:
+                raise RestartRequired(
+                    "The previous receipt transaction snapshot could not be cleaned safely"
+                ) from exc
         self.closed = True
 
 
@@ -495,6 +521,7 @@ def commit_staged_install(
             "The existing extension is loaded and must be released by After Effects"
         )
     backup = destination.with_name(f".{destination.name}.backup-{uuid4().hex}")
+    receipt_backup = receipt_path.with_name(f".{receipt_path.name}.backup-{uuid4().hex}")
     if receipt_path.is_file() and receipt_path.stat().st_size <= 1_048_576:
         old_receipt = receipt_path.read_bytes()
     else:
@@ -510,6 +537,7 @@ def commit_staged_install(
             and destination.exists()
             and receipt_files_match(old_payload, destination)
         ),
+        receipt_backup=receipt_backup if old_receipt is not None else None,
     )
 
     def require_identity() -> None:
@@ -532,15 +560,32 @@ def commit_staged_install(
     try:
         require_identity()
         if destination.exists():
-            _replace_with_retry(destination, backup)
+            _replace_with_retry(destination, backup, before_mutation=require_identity)
             transaction.moved_existing = True
-        _replace_with_retry(staged, destination)
+        if transaction.receipt_backup is not None:
+            _replace_with_retry(
+                receipt_path,
+                transaction.receipt_backup,
+                before_mutation=require_identity,
+            )
+            transaction.moved_receipt = True
+        _replace_with_retry(staged, destination, before_mutation=require_identity)
         transaction.committed_new = True
         receipt["receipt_version"] = 1
         receipt["files"] = file_manifest(destination)
         receipt["manifest_sha256"] = _manifest_digest(receipt["files"])
         require_identity()
-        receipt_writer(receipt_path, receipt)
+        try:
+            receipt_writer(receipt_path, receipt)
+        except BaseException as exc:
+            callback_error = ReceiptCallbackError(
+                "The receipt callback failed after install mutation"
+            )
+            try:
+                transaction.rollback()
+            except BaseException:
+                callback_error.rollback_failed = True
+            raise callback_error from exc
         committed = read_receipt(receipt_path)
         if committed is None or not receipt_files_match(committed, destination):
             raise OSError("After Effects extension receipt did not validate after commit")

@@ -380,19 +380,19 @@ def _install_or_upgrade(
     except InstallIoError as exc:
         reason = str(exc)
         write_bootstrap_error(resolved.bootstrap_error_path, "install", reason, resolved.token)
-        return (
-            build_report(
-                resolved,
-                status="failed",
-                state=installation_state(resolved)[0],
-                steps=steps,
-                mode=mode,
-                failure_stage="install",
-                failure_reason=reason,
-                next_steps=[next_step(retry_command(request), reason, "retry-install")],
-            ),
-            EXIT_INSTALL,
+        report = build_report(
+            resolved,
+            status="failed",
+            state=installation_state(resolved)[0],
+            steps=steps,
+            mode=mode,
+            failure_stage="install",
+            failure_reason=reason,
+            next_steps=[next_step(retry_command(request), reason, "retry-install")],
         )
+        if getattr(exc, "rollback_failed", False):
+            report["rollback_failed"] = True
+        return report, EXIT_INSTALL
     finally:
         remove_staging(staged)
 

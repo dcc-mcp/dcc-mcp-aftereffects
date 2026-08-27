@@ -809,6 +809,7 @@ def _resolve_public_install(
     monkeypatch: pytest.MonkeyPatch,
     *,
     attestations: list[dict[str, object] | None] | None = None,
+    python_path: Path | None = None,
 ):
     host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
     host.parent.mkdir(parents=True)
@@ -851,11 +852,62 @@ def _resolve_public_install(
         InstallRequest(
             "install",
             dcc_path=str(host),
-            python=str(Path(sys.executable).resolve()),
+            python=str(python_path or Path(sys.executable).resolve()),
         ),
         platform="win32",
         environ=environ,
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows junction")
+def test_resolve_host_rejects_real_ancestor_junction_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real" / "Adobe After Effects 2024"
+    host = real / "Support Files" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZnative-test-host")
+    junction = tmp_path / "Adobe After Effects 2024"
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(real)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert linked.returncode == 0, linked.stderr
+    monkeypatch.setattr(
+        install_discovery,
+        "trusted_host_attestation",
+        lambda *_args, **_kwargs: _test_host_attestation(host),
+    )
+
+    with pytest.raises(PreflightError, match="link|reparse"):
+        _resolve_host(
+            InstallRequest("install", dcc_path=str(junction / "Support Files" / "AfterFX.exe")),
+            "win32",
+            {},
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows junction")
+def test_public_preflight_rejects_target_python_ancestor_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    junction = tmp_path / "python-junction"
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(Path(sys.executable).parent)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert linked.returncode == 0, linked.stderr
+
+    with pytest.raises(PreflightError, match="link|reparse"):
+        _resolve_public_install(
+            tmp_path,
+            monkeypatch,
+            python_path=junction / Path(sys.executable).name,
+        )
 
 
 def test_public_preflight_binds_host_python_core_schema_and_cli_provenance(
@@ -1328,6 +1380,7 @@ def test_python_identity_drift_before_receipt_publish_restores_prior_install(
     assert not list(
         resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.backup-*")
     )
+    assert not list(resolved.receipt_path.parent.glob(f".{resolved.receipt_path.name}.backup-*"))
 
 
 def test_editable_source_replacement_has_zero_install_mutation(tmp_path: Path) -> None:
@@ -2113,6 +2166,154 @@ def test_partial_finalize_cleanup_restores_prior_install_from_recovery_snapshot(
         for path in resolved.extension_path.rglob("*")
         if path.is_file()
     } == previous_files
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("receipt-callback"), _ProcessBoundaryFault("receipt-callback")],
+    ids=["ordinary-exception", "base-exception"],
+)
+def test_receipt_callback_failure_restores_exact_prior_receipt_topology(
+    tmp_path: Path, failure: BaseException
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    previous_receipt = resolved.receipt_path.read_bytes()
+    previous_files = {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    }
+    receipt_link = resolved.receipt_path.with_name("receipt-physical-owner.json")
+    os.link(resolved.receipt_path, receipt_link)
+    dependencies = healthy_dependencies(BridgeRunner())
+
+    def publish_then_fail(path: Path, receipt) -> None:
+        install_io.write_receipt(path, receipt)
+        raise failure
+
+    dependencies.receipt_writer = publish_then_fail
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "install"
+    assert "receipt callback failed" in report["verify"]["failure_reason"].lower()
+    assert resolved.receipt_path.read_bytes() == previous_receipt
+    assert os.path.samefile(resolved.receipt_path, receipt_link)
+    assert {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    } == previous_files
+    assert not list(
+        resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.backup-*")
+    )
+
+
+def test_receipt_callback_primary_failure_survives_rollback_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    dependencies = healthy_dependencies(BridgeRunner())
+
+    def publish_then_fail(path: Path, receipt) -> None:
+        install_io.write_receipt(path, receipt)
+        raise RuntimeError("receipt-callback")
+
+    dependencies.receipt_writer = publish_then_fail
+    original_rollback = install_io.InstallTransaction.rollback
+
+    def rollback_then_fail(transaction) -> None:
+        original_rollback(transaction)
+        raise OSError("rollback-reporting-failure")
+
+    monkeypatch.setattr(install_io.InstallTransaction, "rollback", rollback_then_fail)
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["verify"]["failure_stage"] == "install"
+    assert "receipt callback failed" in report["verify"]["failure_reason"].lower()
+    assert report["rollback_failed"] is True
+
+
+def test_identity_drift_inside_first_mutation_primitive_calls_no_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    original_require = install_service._require_exact_install_attestations
+    recaptures = 0
+
+    def drift_on_primitive(current, current_dependencies):
+        nonlocal recaptures
+        recaptures += 1
+        if recaptures == 3:
+            raise install_io.IdentityAttestationError(
+                "The target Python package identities could not be recaptured exactly"
+            )
+        return original_require(current, current_dependencies)
+
+    replace_calls = 0
+    original_replace = install_io.os.replace
+
+    def counted_replace(source, destination):
+        nonlocal replace_calls
+        replace_calls += 1
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(install_service, "_require_exact_install_attestations", drift_on_primitive)
+    monkeypatch.setattr(install_io.os, "replace", counted_replace)
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert recaptures >= 3
+    assert replace_calls == 0
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+def test_unrelated_base_exception_before_transaction_is_not_swallowed(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    dependencies.bridge_runner = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        _ProcessBoundaryFault("host-termination")
+    )
+
+    with pytest.raises(_ProcessBoundaryFault, match="host-termination"):
+        run_lifecycle(
+            InstallRequest("install", as_json=True, yes=True),
+            resolved=resolved,
+            dependencies=dependencies,
+        )
+
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
 
 
 def test_macos_bundle_identity_binds_the_inner_after_effects_process(tmp_path: Path) -> None:

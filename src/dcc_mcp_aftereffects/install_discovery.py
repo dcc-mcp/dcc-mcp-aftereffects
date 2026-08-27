@@ -510,14 +510,20 @@ def recapture_host_attestation(path: Path, expected: Mapping[str, Any]) -> dict[
     try:
         expected_identity = dict(expected)
         platform = expected["platform"]
-        expected_host = Path(expected["host"]["path"]).resolve()
+        expected_host_path = Path(expected["host"]["path"])
         helper = Path(expected["signature_helper"]["path"])
+        if _path_uses_link(path) or _path_uses_link(expected_host_path) or _path_uses_link(helper):
+            return None
+        expected_host = expected_host_path.resolve()
     except (KeyError, OSError, TypeError, ValueError):
         return None
     if not isinstance(platform, str):
         return None
     try:
-        current_host = _host_binary(path, platform).resolve()
+        current_host_path = _host_binary(path, platform)
+        if _path_uses_link(current_host_path):
+            return None
+        current_host = current_host_path.resolve()
     except (OSError, TypeError, ValueError):
         return None
     if os.path.normcase(str(current_host)) != os.path.normcase(str(expected_host)):
@@ -640,6 +646,8 @@ def _resolve_host(
                 "After Effects was not found; pass the exact executable or application with --dcc-path",
             )
         host_path = sorted(candidates, key=lambda item: _version_key(_host_version(item)))[-1]
+    if _path_uses_link(host_path):
+        raise PreflightError("host", "After Effects path crosses a link or reparse boundary")
     if not host_path.exists() or host_path.is_symlink():
         raise PreflightError("host", f"After Effects path does not exist: {host_path}")
     resolved_host = host_path.resolve()
@@ -1139,6 +1147,8 @@ def recapture_python_modules(
 
 def inspect_python_distributions(python_path: Path, _expected: Mapping[str, Any]) -> dict[str, Any]:
     """Read the selected interpreter's unique distributions without importing their modules."""
+    if _path_uses_link(python_path):
+        raise PreflightError("python", "Target Python crosses a link or reparse boundary")
     script = r"""
 import importlib.metadata as metadata
 import csv
@@ -1259,6 +1269,8 @@ print(json.dumps({
 
 
 def _python_metadata(python_path: Path) -> dict[str, Any]:
+    if _path_uses_link(python_path):
+        raise PreflightError("python", "Target Python crosses a link or reparse boundary")
     script = r"""
 import hashlib
 import importlib.metadata as metadata
@@ -1554,6 +1566,8 @@ def resolve_install(
             "The signed After Effects host identity changed during preflight",
         )
     python_path = Path(request.python or sys.executable).expanduser()
+    if _path_uses_link(python_path):
+        raise PreflightError("python", "Target Python crosses a link or reparse boundary")
     if not python_path.is_file():
         raise PreflightError("python", f"Target Python does not exist: {python_path}")
     python_path = python_path.resolve()

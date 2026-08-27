@@ -423,7 +423,8 @@ def test_upgrade_rolls_back_when_receipt_commit_fails(tmp_path):
     )
 
     assert exit_code == EXIT_INSTALL
-    assert report["verify"]["failure_stage"] == "rollback"
+    assert report["verify"]["failure_stage"] == "install"
+    assert "receipt callback failed" in report["verify"]["failure_reason"].lower()
     assert (resolved.extension_path / "manifest.xml").read_bytes() == old_manifest
     assert resolved.receipt_path.read_bytes() == old_receipt
 
