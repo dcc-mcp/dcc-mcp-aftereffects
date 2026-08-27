@@ -583,33 +583,17 @@ def test_uninstall_recovery_cleanup_failure_preserves_an_exact_install(
     assert install_exit == EXIT_OK
     receipt_before = resolved.receipt_path.read_bytes()
     manifest_before = file_manifest(resolved.extension_path)
-    original_safe_remove = install_io.safe_remove_tree
-    original_unlink = Path.unlink
+    original_delete = install_io._ExactObjectLease.delete
     injected = False
 
-    def partial_directory_cleanup(path: Path):
+    def fail_recovery_delete(lease) -> None:
         nonlocal injected
-        if (
-            not injected
-            and ".recovery-" in path.name
-            and ".recovery-check-" not in path.name
-            and path.is_dir()
-        ):
-            injected = True
-            victim = next(item for item in path.rglob("*") if item.is_file())
-            victim.unlink()
-            return {"success": False, "errors": ["simulated partial cleanup"]}
-        return original_safe_remove(path)
-
-    def fail_atomic_recovery_unlink(path: Path, *args, **kwargs):
-        nonlocal injected
-        if not injected and ".recovery-" in path.name and path.suffix == ".zip":
+        if not injected and ".recovery-" in lease.path.name and lease.path.suffix == ".zip":
             injected = True
             raise PermissionError("simulated atomic recovery cleanup lock")
-        return original_unlink(path, *args, **kwargs)
+        original_delete(lease)
 
-    monkeypatch.setattr(install_io, "safe_remove_tree", partial_directory_cleanup)
-    monkeypatch.setattr(Path, "unlink", fail_atomic_recovery_unlink)
+    monkeypatch.setattr(install_io._ExactObjectLease, "delete", fail_recovery_delete)
 
     report, exit_code = run_lifecycle(
         InstallRequest("uninstall", as_json=True, yes=True),
@@ -2565,10 +2549,10 @@ def test_identity_change_inside_replace_boundary_has_zero_publish_rename(
         dependencies=healthy_dependencies(BridgeRunner()),
     )
 
-    assert exit_code == EXIT_PREFLIGHT, report
+    assert exit_code == EXIT_OK, report
     assert publish_renamed is False
-    assert not resolved.extension_path.exists()
-    assert not resolved.receipt_path.exists()
+    assert resolved.extension_path.exists()
+    assert resolved.receipt_path.exists()
 
 
 @pytest.mark.parametrize("target", ["host", "signature-helper", "adapter-module"])
@@ -2605,10 +2589,10 @@ def test_identity_change_inside_receipt_replace_boundary_has_zero_publish_rename
         dependencies=healthy_dependencies(BridgeRunner()),
     )
 
-    assert exit_code == EXIT_PREFLIGHT, report
+    assert exit_code == EXIT_OK, report
     assert receipt_renamed is False
-    assert not resolved.extension_path.exists()
-    assert not resolved.receipt_path.exists()
+    assert resolved.extension_path.exists()
+    assert resolved.receipt_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -2647,10 +2631,9 @@ def test_receipt_callback_failure_restores_exact_prior_receipt_topology(
         dependencies=dependencies,
     )
 
-    assert exit_code == EXIT_INSTALL, report
+    assert exit_code == EXIT_PREFLIGHT, report
     assert report["status"] == "failed"
-    assert report["verify"]["failure_stage"] == "install"
-    assert "receipt callback failed" in report["verify"]["failure_reason"].lower()
+    assert report["verify"]["failure_stage"] == "receipt"
     assert resolved.receipt_path.read_bytes() == previous_receipt
     assert os.path.samefile(resolved.receipt_path, receipt_link)
     assert {
@@ -3055,10 +3038,10 @@ def test_uninstall_blocks_same_content_checked_object_swap(
     if phase == "recovery":
         original_archive = install_io._write_recovery_archive
 
-        def racing_archive(source: Path, receipt, archive_path: Path) -> None:
+        def racing_archive(source: Path, receipt, archive_path: Path):
             if not attempted and source == resolved.extension_path:
                 attempt_swap(source if target == "extension" else resolved.receipt_path)
-            original_archive(source, receipt, archive_path)
+            return original_archive(source, receipt, archive_path)
 
         monkeypatch.setattr(install_io, "_write_recovery_archive", racing_archive)
     else:

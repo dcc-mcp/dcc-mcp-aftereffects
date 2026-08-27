@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -215,14 +216,28 @@ def recapture_resolved_host(
     return current if current == expected else None
 
 
-def installation_state(resolved: ResolvedInstall) -> tuple[str, dict[str, Any] | None]:
-    receipt = read_receipt(resolved.receipt_path)
+def installation_state(
+    resolved: ResolvedInstall,
+    receipt_override: Mapping[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    receipt = (
+        dict(receipt_override)
+        if receipt_override is not None
+        else read_receipt(resolved.receipt_path)
+    )
     exists = resolved.extension_path.is_dir()
     if receipt is None:
         receipt_exists = resolved.receipt_path.exists() or resolved.receipt_path.is_symlink()
         return ("partial" if exists or receipt_exists else "fresh"), None
     if not exists:
         return "partial", receipt
+    if receipt_override is None:
+        try:
+            receipt_details = resolved.receipt_path.lstat()
+        except OSError:
+            return "partial", receipt
+        if stat.S_ISLNK(receipt_details.st_mode) or int(receipt_details.st_nlink) != 1:
+            return "partial", receipt
     if (
         receipt.get("schema_version") != SCHEMA_VERSION
         or receipt.get("dcc_type") != "aftereffects"
@@ -423,9 +438,11 @@ def verify_install(
     request: InstallRequest,
     resolved: ResolvedInstall,
     dependencies: LifecycleDependencies,
+    *,
+    receipt_override: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int]:
     host_identity = recapture_resolved_host(resolved, dependencies)
-    state, _receipt = installation_state(resolved)
+    state, _receipt = installation_state(resolved, receipt_override)
     steps = [{"id": "receipt", "status": "ok" if state == "installed" else "failed"}]
     if host_identity is None:
         reason = "The signed After Effects host identity could not be recaptured exactly"

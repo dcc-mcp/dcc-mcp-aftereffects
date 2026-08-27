@@ -546,7 +546,12 @@ def _install_or_upgrade(
     finally:
         remove_staging(staged)
 
-    verify_report, verify_exit = verify_install(request, resolved, dependencies)
+    verify_report, verify_exit = verify_install(
+        request,
+        resolved,
+        dependencies,
+        receipt_override=transaction.committed_receipt(),
+    )
     steps[4]["status"] = "ok" if verify_exit == EXIT_OK else "failed"
     combined_steps = steps + verify_report["steps"]
     if verify_exit == EXIT_OK:
