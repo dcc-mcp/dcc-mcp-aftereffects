@@ -37,6 +37,10 @@ class RollbackError(InstallIoError):
     pass
 
 
+class IdentityAttestationError(InstallIoError):
+    pass
+
+
 def _redact(value: str, secret: str | None) -> str:
     if secret:
         return value.replace(secret, "<redacted>")
@@ -433,6 +437,7 @@ def commit_staged_install(
     receipt: dict[str, Any],
     receipt_path: Path,
     receipt_writer: Callable[[Path, Mapping[str, Any]], None] = write_receipt,
+    identity_attestor: Callable[[], bool] | None = None,
 ) -> InstallTransaction:
     inspection = inspect_install_root(destination)
     if inspection.get("requires_restart"):
@@ -456,7 +461,15 @@ def commit_staged_install(
             and receipt_files_match(old_payload, destination)
         ),
     )
+
+    def require_identity() -> None:
+        if identity_attestor is not None and identity_attestor() is not True:
+            raise IdentityAttestationError(
+                "The target Python package identities could not be recaptured exactly"
+            )
+
     try:
+        require_identity()
         if destination.exists():
             _replace_with_retry(destination, backup)
             transaction.moved_existing = True
@@ -465,10 +478,19 @@ def commit_staged_install(
         receipt["receipt_version"] = 1
         receipt["files"] = file_manifest(destination)
         receipt["manifest_sha256"] = _manifest_digest(receipt["files"])
+        require_identity()
         receipt_writer(receipt_path, receipt)
         committed = read_receipt(receipt_path)
         if committed is None or not receipt_files_match(committed, destination):
             raise OSError("After Effects extension receipt did not validate after commit")
+    except IdentityAttestationError as exc:
+        try:
+            transaction.rollback()
+        except OSError:
+            raise RollbackError(
+                "Python identity attestation failed and the previous extension could not be restored"
+            ) from exc
+        raise
     except (OSError, TypeError, ValueError) as exc:
         try:
             transaction.rollback()

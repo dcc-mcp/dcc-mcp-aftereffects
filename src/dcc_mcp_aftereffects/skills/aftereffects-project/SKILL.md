@@ -4,7 +4,7 @@ description: >-
   Host skill - inspect, edit, save, and render After Effects projects through
   typed adobepy facades. Use when working with AEP projects and motion intros.
 license: MIT
-compatibility: "After Effects CEP/ExtendScript; dcc-mcp-core 0.19+"
+compatibility: "After Effects CEP/ExtendScript; dcc-mcp-core >=0.20.14,<1.0.0"
 allowed-tools: Python
 metadata:
   dcc-mcp:

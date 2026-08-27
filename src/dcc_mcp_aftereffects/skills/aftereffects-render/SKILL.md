@@ -2,7 +2,7 @@
 name: aftereffects-render
 description: Inspect, queue, configure, and control After Effects render queue items and output modules through typed adobepy facades.
 license: MIT
-compatibility: "After Effects CEP/ExtendScript; dcc-mcp-core 0.19+"
+compatibility: "After Effects CEP/ExtendScript; dcc-mcp-core >=0.20.14,<1.0.0"
 allowed-tools: Python
 metadata:
   dcc-mcp:
