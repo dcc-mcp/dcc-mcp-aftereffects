@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import io
 import json
 import os
 import re
@@ -639,13 +640,15 @@ class _ExactObjectLease:
             )
 
         invalid = _wintypes.HANDLE(-1).value
+        path_is_directory = path.is_dir()
         desired_access = 0x00010000 | 0x00000080
-        if not path.is_dir():
+        if not path_is_directory:
             desired_access |= 0x80000000
+        share_mode = 0x1 | (0x2 if path_is_directory else 0)
         handle = _KERNEL32.CreateFileW(
             str(path),
             desired_access,
-            0x1 | 0x2,
+            share_mode,
             None,
             3,
             0x02000000 | 0x00200000,
@@ -665,6 +668,12 @@ class _ExactObjectLease:
                 stage="identity_attestation",
             )
         is_directory = bool(information.attributes & 0x10)
+        if not is_directory and int(information.links) != 1:
+            _KERNEL32.CloseHandle(handle)
+            raise IdentityAttestationError(
+                "A checked receipt or recovery object has multiple links",
+                stage="identity_attestation",
+            )
         return cls(
             path=path,
             physical={
@@ -776,7 +785,8 @@ class _ExactObjectLease:
         if self.closed:
             return
         if os.name == "nt":
-            _KERNEL32.CloseHandle(self.native_handle)
+            if not _KERNEL32.CloseHandle(self.native_handle):
+                raise ctypes.WinError(ctypes.get_last_error() or 6)
         elif self.file_descriptor is not None:
             os.close(self.file_descriptor)
         self.closed = True
@@ -839,12 +849,15 @@ class InstallTransaction:
     committed_new: bool = False
     closed: bool = False
     recovery_archive: Path | None = None
+    recovery_archive_lease: _ExactObjectLease | None = None
     identity_attestor: Callable[[], bool] | None = None
     identity_paths: tuple[Path, ...] = ()
     mutation_root_attestor: Callable[[], bool] | None = None
     mutation_root_paths: tuple[Path, ...] = ()
     previous_extension_lease: _ExactObjectLease | None = None
     previous_receipt_lease: _ExactObjectLease | None = None
+    committed_extension_lease: _ExactObjectLease | None = None
+    committed_receipt_lease: _ExactObjectLease | None = None
 
     @staticmethod
     def _require_attestation(
@@ -887,6 +900,11 @@ class InstallTransaction:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def committed_receipt(self) -> dict[str, Any] | None:
+        if self.committed_receipt_lease is None:
+            return None
+        return _receipt_from_bytes(self.committed_receipt_lease.read_bytes())
+
     def _require_previous_receipt_object(self) -> None:
         if (
             self.old_receipt is None
@@ -898,13 +916,30 @@ class InstallTransaction:
                 stage="identity_attestation",
             )
 
-    def _release_exact_object_leases(self) -> None:
-        if self.previous_extension_lease is not None:
-            self.previous_extension_lease.close()
-            self.previous_extension_lease = None
-        if self.previous_receipt_lease is not None:
-            self.previous_receipt_lease.close()
-            self.previous_receipt_lease = None
+    def _release_exact_object_leases(self, *, include_recovery: bool = True) -> None:
+        failures: list[BaseException] = []
+        attributes = [
+            "previous_extension_lease",
+            "previous_receipt_lease",
+            "committed_extension_lease",
+            "committed_receipt_lease",
+        ]
+        if include_recovery:
+            attributes.append("recovery_archive_lease")
+        for attribute in attributes:
+            lease = getattr(self, attribute)
+            if lease is None:
+                continue
+            try:
+                lease.close()
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                setattr(self, attribute, None)
+        if failures:
+            error = RollbackError("Exact-object lease cleanup failed")
+            error.cleanup_failures = tuple(str(failure)[:512] for failure in failures)
+            raise error from failures[0]
 
     def rollback(self) -> None:
         if self.closed:
@@ -913,9 +948,19 @@ class InstallTransaction:
         try:
             with _hold_identity_paths(self.mutation_root_paths):
                 self._require_mutation_roots()
-                if self.committed_new and self.destination.exists():
+                if self.committed_new:
                     self._require_mutation_roots()
-                    _replace_with_retry(self.destination, failed)
+                    if self.committed_extension_lease is None:
+                        raise OSError("committed extension object lease is unavailable")
+                    self.committed_extension_lease.rename(failed)
+                    cleanup = _delete_leased_tree(self.committed_extension_lease)
+                    if not cleanup.get("success"):
+                        raise OSError("committed extension object could not be retired")
+                    self.committed_extension_lease = None
+                if self.committed_receipt_lease is not None:
+                    self._require_mutation_roots()
+                    self.committed_receipt_lease.delete()
+                    self.committed_receipt_lease = None
                 if self.moved_existing:
                     prior_receipt = self._prior_receipt()
                     self._require_mutation_roots()
@@ -931,8 +976,10 @@ class InstallTransaction:
                             if not cleanup.get("success"):
                                 raise OSError("previous extension backup could not be retired")
                             self.previous_extension_lease = None
+                        if self.recovery_archive_lease is None:
+                            raise OSError("previous extension recovery lease is unavailable")
                         _restore_recovery_archive(
-                            self.recovery_archive,
+                            self.recovery_archive_lease.read_bytes(maximum=272 * 1024 * 1024),
                             self.destination,
                             prior_receipt,
                         )
@@ -946,14 +993,13 @@ class InstallTransaction:
                         and self.previous_receipt_lease is not None
                     ):
                         self._require_previous_receipt_object()
-                        self.previous_receipt_lease.rename(self.receipt_path, replace=True)
+                        self.previous_receipt_lease.rename(self.receipt_path)
                     elif self.old_receipt is not None:
                         _write_receipt_bytes(self.receipt_path, self.old_receipt)
                     else:
                         raise OSError("previous After Effects receipt backup is unavailable")
-                elif self.old_receipt is None:
-                    self._require_mutation_roots()
-                    self.receipt_path.unlink(missing_ok=True)
+                elif self.old_receipt is None and self.receipt_path.exists():
+                    raise OSError("an unleased receipt object appeared during rollback")
                 if self.old_receipt_valid:
                     if self.previous_receipt_lease is not None:
                         restored = _receipt_from_bytes(self.previous_receipt_lease.read_bytes())
@@ -976,7 +1022,10 @@ class InstallTransaction:
             if self.closed and self.recovery_archive is not None:
                 try:
                     self._require_mutation_roots()
-                    self.recovery_archive.unlink(missing_ok=True)
+                    if self.recovery_archive_lease is None:
+                        raise OSError("recovery archive object lease is unavailable")
+                    self.recovery_archive_lease.delete()
+                    self.recovery_archive_lease = None
                 except OSError:
                     pass
             if self.closed and self.receipt_backup is not None and self.receipt_backup.exists():
@@ -1004,11 +1053,14 @@ class InstallTransaction:
                 )
                 try:
                     self._require_identity()
-                    _write_recovery_archive(self.backup, prior_receipt, recovery_archive)
-                    _validate_recovery_archive(recovery_archive, self.backup, prior_receipt)
+                    self.recovery_archive_lease = _write_recovery_archive(
+                        self.backup, prior_receipt, recovery_archive
+                    )
                 except BaseException as exc:
                     try:
-                        recovery_archive.unlink(missing_ok=True)
+                        if self.recovery_archive_lease is not None:
+                            self.recovery_archive_lease.delete()
+                            self.recovery_archive_lease = None
                     except BaseException:
                         pass
                     if isinstance(exc, IdentityAttestationError):
@@ -1054,10 +1106,22 @@ class InstallTransaction:
                         "The previous receipt transaction snapshot could not be cleaned safely"
                     ) from exc
                 self.previous_receipt_lease = None
-            if self.recovery_archive is not None and self.recovery_archive.exists():
+            try:
+                self._release_exact_object_leases(include_recovery=False)
+            except RollbackError as exc:
+                raise RestartRequired(
+                    "The transaction object leases could not be released safely"
+                ) from exc
+            if self.recovery_archive is not None:
                 try:
                     self._require_identity()
-                    self.recovery_archive.unlink()
+                    if self.recovery_archive_lease is None:
+                        raise IdentityAttestationError(
+                            "The recovery archive object lease was lost before cleanup",
+                            stage="identity_attestation",
+                        )
+                    self.recovery_archive_lease.delete()
+                    self.recovery_archive_lease = None
                 except IdentityAttestationError:
                     raise
                 except BaseException as exc:
@@ -1067,7 +1131,6 @@ class InstallTransaction:
             self.receipt_backup = None
             self.recovery_archive = None
             self.closed = True
-            self._release_exact_object_leases()
 
 
 def commit_staged_install(
@@ -1082,6 +1145,7 @@ def commit_staged_install(
     mutation_root_attestor: Callable[[], bool] | None = None,
     mutation_root_paths: tuple[Path, ...] = (),
 ) -> InstallTransaction:
+    receipt_temporary = receipt_path.with_name(f".{receipt_path.name}.new-{uuid4().hex}.tmp")
     previous_extension_lease = (
         _ExactObjectLease.acquire(destination)
         if destination.exists() or destination.is_symlink()
@@ -1096,6 +1160,14 @@ def commit_staged_install(
     except BaseException:
         if previous_extension_lease is not None:
             previous_extension_lease.close()
+        raise
+    try:
+        committed_extension_lease = _ExactObjectLease.acquire(staged)
+    except BaseException:
+        if previous_extension_lease is not None:
+            previous_extension_lease.close()
+        if previous_receipt_lease is not None:
+            previous_receipt_lease.close()
         raise
     try:
         inspection = inspect_install_root(destination)
@@ -1118,6 +1190,7 @@ def commit_staged_install(
             previous_extension_lease.close()
         if previous_receipt_lease is not None:
             previous_receipt_lease.close()
+        committed_extension_lease.close()
         raise
     transaction = InstallTransaction(
         destination=destination,
@@ -1136,6 +1209,7 @@ def commit_staged_install(
         mutation_root_paths=mutation_root_paths,
         previous_extension_lease=previous_extension_lease,
         previous_receipt_lease=previous_receipt_lease,
+        committed_extension_lease=committed_extension_lease,
     )
 
     def require_identity() -> None:
@@ -1179,12 +1253,9 @@ def commit_staged_install(
             transaction._require_previous_receipt_object()
             rename_checked_object(transaction.previous_receipt_lease, transaction.receipt_backup)
             transaction.moved_receipt = True
-        _replace_with_retry(
-            staged,
-            destination,
-            before_mutation=require_identity,
-            identity_paths=identity_paths,
-        )
+        with _hold_identity_paths(identity_paths):
+            require_identity()
+            transaction.committed_extension_lease.rename(destination)
         transaction.committed_new = True
         receipt["receipt_version"] = 1
         receipt["files"] = file_manifest(destination)
@@ -1192,7 +1263,7 @@ def commit_staged_install(
         try:
             with _hold_identity_paths(identity_paths):
                 require_identity()
-                receipt_writer(receipt_path, receipt)
+                receipt_writer(receipt_temporary, receipt)
         except IdentityAttestationError:
             raise
         except BaseException as exc:
@@ -1204,9 +1275,14 @@ def commit_staged_install(
             except BaseException:
                 callback_error.rollback_failed = True
             raise callback_error from exc
-        committed = read_receipt(receipt_path)
+        transaction.committed_receipt_lease = _ExactObjectLease.acquire(receipt_temporary)
+        committed = _receipt_from_bytes(transaction.committed_receipt_lease.read_bytes())
         if committed is None or not receipt_files_match(committed, destination):
             raise OSError("After Effects extension receipt did not validate after commit")
+        with _hold_identity_paths(identity_paths):
+            require_identity()
+            transaction.committed_receipt_lease.rename(receipt_path)
+            require_identity()
     except IdentityAttestationError as exc:
         try:
             transaction.rollback()
@@ -1228,6 +1304,12 @@ def commit_staged_install(
     finally:
         if staged.exists():
             safe_remove_tree(staged)
+        if receipt_temporary.exists():
+            try:
+                temporary_lease = _ExactObjectLease.acquire(receipt_temporary)
+                temporary_lease.delete()
+            except OSError:
+                pass
     return transaction
 
 
@@ -1235,11 +1317,12 @@ def _write_recovery_archive(
     source: Path,
     receipt: Mapping[str, Any],
     archive_path: Path,
-) -> None:
+) -> _ExactObjectLease:
     entries = receipt.get("files")
     if not isinstance(entries, list) or not receipt_files_match(receipt, source):
         raise OSError("After Effects recovery source does not match its receipt")
     temporary = archive_path.with_name(f".{archive_path.name}.{uuid4().hex}.tmp")
+    temporary_lease: _ExactObjectLease | None = None
     try:
         with zipfile.ZipFile(temporary, mode="x", compression=zipfile.ZIP_STORED) as archive:
             for entry in entries:
@@ -1259,13 +1342,23 @@ def _write_recovery_archive(
                 if len(contents) != entry.get("bytes") or _sha256(contents) != entry.get("sha256"):
                     raise OSError("After Effects recovery source changed during snapshot")
                 archive.writestr(relative.as_posix(), contents)
-        _replace_with_retry(temporary, archive_path)
+        _validate_recovery_archive(temporary, source, receipt)
+        temporary_lease = _ExactObjectLease.acquire(temporary)
+        temporary_lease.rename(archive_path)
+        return temporary_lease
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary.exists():
+            if temporary_lease is not None:
+                try:
+                    temporary_lease.delete()
+                except OSError:
+                    pass
+            else:
+                temporary.unlink(missing_ok=True)
 
 
 def _restore_recovery_archive(
-    archive_path: Path,
+    archive_source: Path | bytes,
     destination: Path,
     receipt: Mapping[str, Any],
 ) -> None:
@@ -1281,7 +1374,11 @@ def _restore_recovery_archive(
         raise OSError("After Effects recovery receipt contains duplicate or unsafe paths")
     staging = destination.with_name(f".{destination.name}.restore-{uuid4().hex}")
     try:
-        with zipfile.ZipFile(archive_path, mode="r") as archive:
+        archive_input: Path | io.BytesIO
+        archive_input = (
+            io.BytesIO(archive_source) if isinstance(archive_source, bytes) else archive_source
+        )
+        with zipfile.ZipFile(archive_input, mode="r") as archive:
             members = archive.infolist()
             if len(members) != len(expected) or {member.filename for member in members} != set(
                 expected
@@ -1369,6 +1466,7 @@ def _remove_receipted_install(
     receipt: dict[str, Any] | None = None
     receipt_bytes = b""
     moved = False
+    recovery_lease: _ExactObjectLease | None = None
 
     def cleanup(path: Path) -> bool:
         if not path.exists() and not path.is_symlink():
@@ -1388,7 +1486,13 @@ def _remove_receipted_install(
                 raise OSError("After Effects failed destination could not be quarantined")
             if receipt is None:
                 raise OSError("After Effects uninstall recovery receipt is unavailable")
-            _restore_recovery_archive(recovery, destination, receipt)
+            if recovery_lease is None:
+                raise OSError("After Effects uninstall recovery lease is unavailable")
+            _restore_recovery_archive(
+                recovery_lease.read_bytes(maximum=272 * 1024 * 1024),
+                destination,
+                receipt,
+            )
             if receipt_lease is None:
                 _write_receipt_bytes(receipt_path, receipt_bytes)
             restored = (
@@ -1419,8 +1523,7 @@ def _remove_receipted_install(
             raise RestartRequired("After Effects holds the receipted extension open")
         if before_mutation is not None:
             before_mutation()
-        _write_recovery_archive(destination, receipt, recovery)
-        _validate_recovery_archive(recovery, destination, receipt)
+        recovery_lease = _write_recovery_archive(destination, receipt, recovery)
         if before_mutation is not None:
             before_mutation()
         extension_lease.rename(quarantine)
@@ -1435,7 +1538,9 @@ def _remove_receipted_install(
         receipt_lease = None
     except IdentityAttestationError as exc:
         if not moved:
-            cleanup(recovery)
+            if recovery_lease is not None:
+                recovery_lease.delete()
+                recovery_lease = None
         elif not restore():
             exc.rollback_failed = True
         raise
@@ -1443,7 +1548,9 @@ def _remove_receipted_install(
         raise
     except OSError as exc:
         if not moved:
-            cleanup(recovery)
+            if recovery_lease is not None:
+                recovery_lease.delete()
+                recovery_lease = None
             if _locked_error(exc):
                 raise RestartRequired("After Effects holds the receipted extension open") from exc
             raise InstallIoError(
@@ -1462,9 +1569,16 @@ def _remove_receipted_install(
         if receipt_lease is not None:
             receipt_lease.close()
     try:
-        recovery.unlink()
+        if recovery_lease is None:
+            raise OSError("After Effects uninstall recovery lease is unavailable")
+        recovery_lease.delete()
+        recovery_lease = None
     except OSError as exc:
-        if restore():
+        restored = restore()
+        if recovery_lease is not None:
+            recovery_lease.close()
+            recovery_lease = None
+        if restored:
             raise RestartRequired("Uninstall cleanup failed; the extension was restored") from exc
         raise RollbackError(
             "Uninstall cleanup failed and recovery requires operator action"
