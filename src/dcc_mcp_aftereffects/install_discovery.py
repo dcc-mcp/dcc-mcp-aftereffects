@@ -828,6 +828,7 @@ def _plain_file_identity(path: Path, maximum: int, *, allow_empty: bool = False)
         or before.st_size < 0
         or (before.st_size == 0 and not allow_empty)
         or before.st_size > maximum
+        or int(before.st_nlink) != 1
     ):
         raise ValueError("file physical identity is unsupported")
     digest = hashlib.sha256()

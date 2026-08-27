@@ -342,6 +342,7 @@ def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path)
         "verify",
         "receipt",
         "host-attestation",
+        "python-attestation",
         "target-import",
         "typed-readiness",
     ]

@@ -13,6 +13,7 @@ import zipfile
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -1075,6 +1076,185 @@ def test_verify_requires_exact_host_recapture_before_import_or_runtime_processes
     assert probe_calls == {"import": 0, "readiness": 0, "process": 0}
 
 
+def test_verify_rejects_receipted_python_distribution_identity_drift(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK, installed
+
+    receipt = json.loads(resolved.receipt_path.read_text(encoding="utf-8"))
+    receipt["python_modules"]["core"]["version"] = "1.0.0"
+    install_io.write_receipt(resolved.receipt_path, receipt)
+    tampered_receipt = resolved.receipt_path.read_bytes()
+    installed_manifest = (resolved.extension_path / "manifest.xml").read_bytes()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("verify", as_json=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "receipt"
+    assert resolved.receipt_path.read_bytes() == tampered_receipt
+    assert (resolved.extension_path / "manifest.xml").read_bytes() == installed_manifest
+
+
+@pytest.mark.parametrize("mode", ["missing", "legacy", "incomplete", "malformed"])
+def test_verify_rejects_unowned_receipted_python_identity(tmp_path: Path, mode: str) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK, installed
+
+    receipt = json.loads(resolved.receipt_path.read_text(encoding="utf-8"))
+    if mode == "missing":
+        receipt.pop("python_modules")
+    elif mode == "legacy":
+        receipt["python_modules"] = {"core": "0.20.14", "adapter": "0.7.0"}
+    elif mode == "incomplete":
+        receipt["python_modules"].pop("adobepy")
+    else:
+        receipt["python_modules"] = ["dcc-mcp-core", "dcc-mcp-aftereffects", "adobepy"]
+    install_io.write_receipt(resolved.receipt_path, receipt)
+    receipt_before = resolved.receipt_path.read_bytes()
+    manifest_before = (resolved.extension_path / "manifest.xml").read_bytes()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("verify", as_json=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY, report
+    assert report["verify"]["failure_stage"] == "receipt"
+    assert resolved.receipt_path.read_bytes() == receipt_before
+    assert (resolved.extension_path / "manifest.xml").read_bytes() == manifest_before
+
+
+def test_verify_recaptures_target_python_distributions_before_import(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK, installed
+
+    receipt_before = resolved.receipt_path.read_bytes()
+    manifest_before = (resolved.extension_path / "manifest.xml").read_bytes()
+    original_distribution_probe = dependencies.python_distribution_probe
+    calls = {"python": 0, "import": 0, "readiness": 0, "process": 0}
+
+    def drifted_distributions(python_path: Path, expected):
+        calls["python"] += 1
+        observed = deepcopy(original_distribution_probe(python_path, expected))
+        observed["core"]["version"] = "1.0.0"
+        return observed
+
+    def unexpected_import(_python_path: Path):
+        calls["import"] += 1
+        return True, "unexpected"
+
+    def unexpected_readiness(current):
+        calls["readiness"] += 1
+        return healthy_dependencies(BridgeRunner()).readiness_probe(current)
+
+    def unexpected_process(_pid: int):
+        calls["process"] += 1
+        return {}
+
+    dependencies.python_distribution_probe = drifted_distributions
+    dependencies.import_probe = unexpected_import
+    dependencies.readiness_probe = unexpected_readiness
+    dependencies.process_probe = unexpected_process
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("verify", as_json=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert calls == {"python": 1, "import": 0, "readiness": 0, "process": 0}
+    assert resolved.receipt_path.read_bytes() == receipt_before
+    assert (resolved.extension_path / "manifest.xml").read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize("mode", ["exception", "empty", "missing", "malformed"])
+def test_verify_fails_closed_on_unusable_python_distribution_recapture(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    assert install_exit == EXIT_OK, installed
+
+    receipt_before = resolved.receipt_path.read_bytes()
+    manifest_before = (resolved.extension_path / "manifest.xml").read_bytes()
+    original_distribution_probe = dependencies.python_distribution_probe
+    calls = {"python": 0, "import": 0, "readiness": 0, "process": 0}
+
+    def unusable_distributions(python_path: Path, expected):
+        calls["python"] += 1
+        if mode == "exception":
+            raise RuntimeError("untrusted distribution probe failure")
+        observed = deepcopy(original_distribution_probe(python_path, expected))
+        if mode == "empty":
+            return {}
+        if mode == "missing":
+            observed.pop("core")
+        else:
+            observed["core"] = "foreign"
+        return observed
+
+    def unexpected_import(_path: Path):
+        calls["import"] += 1
+        return True, "unexpected"
+
+    def unexpected_readiness(_resolved):
+        calls["readiness"] += 1
+        return None
+
+    def unexpected_process(_pid: int):
+        calls["process"] += 1
+        return {}
+
+    dependencies.python_distribution_probe = unusable_distributions
+    dependencies.import_probe = unexpected_import
+    dependencies.readiness_probe = unexpected_readiness
+    dependencies.process_probe = unexpected_process
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("verify", as_json=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY, report
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert calls == {"python": 1, "import": 0, "readiness": 0, "process": 0}
+    assert resolved.receipt_path.read_bytes() == receipt_before
+    assert (resolved.extension_path / "manifest.xml").read_bytes() == manifest_before
+
+
 def test_python_module_byte_drift_stops_before_staging_or_installer(
     tmp_path: Path,
 ) -> None:
@@ -1316,6 +1496,82 @@ def test_python_identity_drift_before_finalize_rolls_back_new_publish(
     assert not resolved.receipt_path.exists()
 
 
+def test_post_commit_python_attestation_failure_keeps_preflight_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+    adapter_module = Path(resolved.python_modules["adapter"]["module_path"])
+    original_verify = install_service.verify_install
+
+    def drift_then_verify(*args, **kwargs):
+        replacement = adapter_module.with_suffix(".post-commit-replacement")
+        replacement.write_bytes(adapter_module.read_bytes())
+        os.replace(replacement, adapter_module)
+        return original_verify(*args, **kwargs)
+
+    monkeypatch.setattr(install_service, "verify_install", drift_then_verify)
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert (
+        report["verify"]["failure_reason"]
+        == "The target Python package identities could not be recaptured exactly"
+    )
+    assert len(runner.calls) == 1
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+def test_post_commit_python_attestation_primary_survives_rollback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    dependencies = healthy_dependencies(BridgeRunner())
+    adapter_module = Path(resolved.python_modules["adapter"]["module_path"])
+    original_verify = install_service.verify_install
+    original_rollback = install_io.InstallTransaction.rollback
+
+    def drift_then_verify(*args, **kwargs):
+        replacement = adapter_module.with_suffix(".post-commit-replacement")
+        replacement.write_bytes(adapter_module.read_bytes())
+        os.replace(replacement, adapter_module)
+        return original_verify(*args, **kwargs)
+
+    def rollback_then_report_failure(transaction):
+        original_rollback(transaction)
+        raise OSError("simulated rollback reporting failure")
+
+    monkeypatch.setattr(install_service, "verify_install", drift_then_verify)
+    monkeypatch.setattr(install_io.InstallTransaction, "rollback", rollback_then_report_failure)
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert (
+        report["verify"]["failure_reason"]
+        == "The target Python package identities could not be recaptured exactly"
+    )
+    assert report["rollback_failed"] is True
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
 def test_python_identity_drift_before_receipt_publish_restores_prior_install(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1437,6 +1693,31 @@ def test_python_capture_binds_name_and_version_to_metadata_bytes(tmp_path: Path)
 
     with pytest.raises(PreflightError, match="owned by their selected distributions"):
         capture_python_modules(raw_modules)
+
+
+def test_python_capture_rejects_an_initial_hardlinked_module(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    raw_modules: dict[str, object] = {}
+    for key, identity in resolved.python_modules.items():
+        raw_modules[key] = {
+            "name": identity["metadata_name"],
+            "distribution": identity["distribution"],
+            "version": identity["version"],
+            "module_path": identity["module_path"],
+            "distribution_root": identity["distribution_root"],
+            "metadata_path": identity["metadata_path"],
+            "records": [identity["record"]],
+            "direct_url": None,
+        }
+    module = Path(resolved.python_modules["adapter"]["module_path"])
+    alias = module.with_name(f".{module.name}.capture-hardlink-{uuid4().hex}")
+    os.link(module, alias)
+    try:
+        assert module.stat().st_nlink == 2
+        with pytest.raises(PreflightError, match="owned|identity|link"):
+            capture_python_modules(raw_modules)
+    finally:
+        alias.unlink(missing_ok=True)
 
 
 def test_python_recapture_rederives_name_and_version_from_current_metadata(
