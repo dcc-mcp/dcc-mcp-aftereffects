@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import ctypes
 import hashlib
+import io
 import json
 import os
 import plistlib
@@ -12,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -37,6 +41,14 @@ _FINAL_VERSION = re.compile(
     r"(?:\.(0|[1-9][0-9]{0,8}))?(?:\.(0|[1-9][0-9]{0,8}))?"
 )
 _TARGET = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_PYTHON_MODULES = {
+    "adapter": ("dcc-mcp-aftereffects", "dcc_mcp_aftereffects"),
+    "core": ("dcc-mcp-core", "dcc_mcp_core"),
+    "adobepy": ("adobepy", "adobe.after_effects"),
+}
+_MAX_PYTHON_MODULE_BYTES = 32 * 1024 * 1024
+_MAX_DISTRIBUTION_METADATA_BYTES = 16 * 1024 * 1024
+_MAX_DISTRIBUTION_METADATA_FILES = 256
 _PUBLISHED_ADOBEPY_RELEASES: dict[tuple[str, str], dict[str, str]] = {
     ("0.6.2", "windows-x64"): {
         "cli_sha256": "c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa",
@@ -741,60 +753,428 @@ def _version_key(value: str) -> Version:
         raise PreflightError("version", f"Invalid version value: {value}") from exc
 
 
+def _normalized_distribution_name(value: Any) -> str:
+    if not isinstance(value, str) or not 0 < len(value) <= 256 or "\0" in value:
+        return ""
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+def _absolute_path(value: Any) -> Path:
+    if not isinstance(value, str) or not 0 < len(value) <= 4_096 or "\0" in value:
+        raise ValueError("invalid bounded path")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("path is not absolute")
+    return Path(os.path.abspath(path))
+
+
+def _physical_identity(details: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(details.st_dev),
+        "inode": int(details.st_ino),
+        "mode": int(details.st_mode),
+        "links": int(details.st_nlink),
+        "modified_ns": int(details.st_mtime_ns),
+        "changed_ns": int(details.st_ctime_ns),
+    }
+
+
+def _plain_directory_identity(path: Path) -> dict[str, Any]:
+    path = Path(os.path.abspath(path))
+    if _path_uses_link(path):
+        raise ValueError("directory crosses a link or reparse boundary")
+    details = path.lstat()
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValueError("directory identity is unavailable")
+    return {"path": str(path), "physical": _physical_identity(details)}
+
+
+def _plain_file_identity(path: Path, maximum: int, *, allow_empty: bool = False) -> dict[str, Any]:
+    path = Path(os.path.abspath(path))
+    if _path_uses_link(path):
+        raise ValueError("file crosses a link or reparse boundary")
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size < 0
+        or (before.st_size == 0 and not allow_empty)
+        or before.st_size > maximum
+    ):
+        raise ValueError("file physical identity is unsupported")
+    digest = hashlib.sha256()
+    observed = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            observed += len(chunk)
+            if observed > maximum:
+                raise ValueError("file exceeds bounded identity size")
+            digest.update(chunk)
+    after = path.lstat()
+    if observed != before.st_size or _physical_identity(before) != _physical_identity(after):
+        raise ValueError("file changed while its identity was captured")
+    return {
+        "path": str(path),
+        "bytes": observed,
+        "sha256": digest.hexdigest(),
+        "physical": _physical_identity(after),
+    }
+
+
+def _owned_directory_chain(path: Path, root: Path) -> list[dict[str, Any]]:
+    path = Path(os.path.abspath(path))
+    root = Path(os.path.abspath(root))
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("path is outside its ownership root") from exc
+    chain = [_plain_directory_identity(root)]
+    current = root
+    for part in relative.parts:
+        current /= part
+        chain.append(_plain_directory_identity(current))
+    return chain
+
+
+def _module_identity(path: Path, ownership_root: Path) -> dict[str, Any]:
+    return {
+        "ownership_chain": _owned_directory_chain(path.parent, ownership_root),
+        "file": _plain_file_identity(path, _MAX_PYTHON_MODULE_BYTES),
+    }
+
+
+def _metadata_identity(metadata_path: Path, distribution_root: Path) -> dict[str, Any]:
+    metadata_path = Path(os.path.abspath(metadata_path))
+    distribution_root = Path(os.path.abspath(distribution_root))
+    chain = _owned_directory_chain(metadata_path, distribution_root)
+    entries: list[dict[str, Any]] = []
+    total_bytes = 0
+    for current, directories, files in os.walk(metadata_path, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories.sort()
+        files.sort()
+        for name in directories:
+            directory = current_path / name
+            entries.append(
+                {
+                    "path": directory.relative_to(metadata_path).as_posix(),
+                    "type": "directory",
+                    "identity": _plain_directory_identity(directory),
+                }
+            )
+        for name in files:
+            file_path = current_path / name
+            identity = _plain_file_identity(
+                file_path, _MAX_DISTRIBUTION_METADATA_BYTES, allow_empty=True
+            )
+            total_bytes += int(identity["bytes"])
+            if total_bytes > _MAX_DISTRIBUTION_METADATA_BYTES:
+                raise ValueError("distribution metadata exceeds bounded identity size")
+            entries.append(
+                {
+                    "path": file_path.relative_to(metadata_path).as_posix(),
+                    "type": "file",
+                    "identity": identity,
+                }
+            )
+        if len(entries) > _MAX_DISTRIBUTION_METADATA_FILES:
+            raise ValueError("distribution metadata has too many entries")
+    files_by_name = {
+        entry["path"]: entry["identity"] for entry in entries if entry["type"] == "file"
+    }
+    if any(
+        not isinstance(files_by_name.get(name), Mapping) or files_by_name[name].get("bytes", 0) <= 0
+        for name in ("METADATA", "RECORD")
+    ):
+        raise ValueError("distribution metadata is incomplete")
+    return {
+        "root": str(metadata_path),
+        "ownership_chain": chain,
+        "entries": sorted(entries, key=lambda item: (item["path"], item["type"])),
+    }
+
+
+def _captured_metadata_bytes(
+    metadata_path: Path,
+    snapshot: Mapping[str, Any],
+    name: str,
+    *,
+    required: bool,
+) -> bytes | None:
+    entry = next(
+        (
+            item
+            for item in snapshot.get("entries", ())
+            if isinstance(item, Mapping) and item.get("path") == name and item.get("type") == "file"
+        ),
+        None,
+    )
+    if entry is None:
+        if required:
+            raise ValueError("required distribution metadata is missing")
+        return None
+    expected = entry.get("identity")
+    if not isinstance(expected, Mapping):
+        raise ValueError("distribution metadata identity is invalid")
+    path = metadata_path / name
+    before = _plain_file_identity(path, _MAX_DISTRIBUTION_METADATA_BYTES, allow_empty=not required)
+    contents = path.read_bytes()
+    after = _plain_file_identity(path, _MAX_DISTRIBUTION_METADATA_BYTES, allow_empty=not required)
+    if (
+        before != dict(expected)
+        or before != after
+        or len(contents) != before["bytes"]
+        or hashlib.sha256(contents).hexdigest() != before["sha256"]
+    ):
+        raise ValueError("distribution metadata changed while it was captured")
+    return contents
+
+
+def _record_identity(contents: bytes, package_path: Path) -> dict[str, Any]:
+    target = package_path.as_posix()
+    try:
+        rows = list(csv.reader(io.StringIO(contents.decode("utf-8"), newline="")))
+        matches = [row for row in rows if len(row) == 3 and row[0] == target]
+        if len(matches) != 1 or not matches[0][1] or not matches[0][2]:
+            raise ValueError("module lacks one exact RECORD owner")
+        path, digest, size = matches[0]
+        parsed_size = int(size)
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("distribution RECORD identity is invalid") from exc
+    return {"path": path, "hash": digest, "size": parsed_size}
+
+
+def _local_editable_root(value: Any) -> Path | None:
+    if not isinstance(value, dict) or set(value) != {"url", "dir_info"}:
+        return None
+    info = value.get("dir_info")
+    url = value.get("url")
+    if not isinstance(info, dict) or info.get("editable") is not True or not isinstance(url, str):
+        return None
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "file"
+        or parsed.netloc not in {"", "localhost"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    from urllib.parse import unquote
+    from urllib.request import url2pathname
+
+    raw_path = url2pathname(unquote(parsed.path))
+    if re.fullmatch(r"/[A-Za-z]:/.*", raw_path):
+        raw_path = raw_path[1:]
+    try:
+        root = Path(os.path.abspath(raw_path))
+        _plain_directory_identity(root)
+    except (OSError, TypeError, ValueError):
+        return None
+    return root
+
+
+def _record_hash_matches(digest: str, record_hash: Any) -> bool:
+    if not isinstance(record_hash, str) or not record_hash.startswith("sha256="):
+        return False
+    expected = record_hash.removeprefix("sha256=").rstrip("=")
+    actual = base64.urlsafe_b64encode(bytes.fromhex(digest)).decode("ascii").rstrip("=")
+    return actual == expected
+
+
+def _capture_python_module(
+    raw: Mapping[str, Any], distribution: str, package: str
+) -> dict[str, Any]:
+    if raw.get("distribution") != distribution or (
+        _normalized_distribution_name(raw.get("name"))
+        != _normalized_distribution_name(distribution)
+    ):
+        raise ValueError("distribution identity does not match the requested product")
+    version = raw.get("version")
+    _version_key(version)
+    module_path = _absolute_path(raw.get("module_path"))
+    distribution_root = _absolute_path(raw.get("distribution_root"))
+    metadata_path = _absolute_path(raw.get("metadata_path"))
+    metadata_snapshot = _metadata_identity(metadata_path, distribution_root)
+    package_path = Path(*package.split(".")) / "__init__.py"
+    metadata_contents = _captured_metadata_bytes(
+        metadata_path, metadata_snapshot, "METADATA", required=True
+    )
+    headers = BytesParser().parsebytes(metadata_contents, headersonly=True)
+    if (
+        _normalized_distribution_name(headers.get("Name"))
+        != _normalized_distribution_name(distribution)
+        or headers.get("Version") != version
+    ):
+        raise ValueError("distribution metadata does not match its selected identity")
+    direct_url_contents = _captured_metadata_bytes(
+        metadata_path, metadata_snapshot, "direct_url.json", required=False
+    )
+    direct_url = json.loads(direct_url_contents) if direct_url_contents is not None else None
+    if direct_url != raw.get("direct_url"):
+        raise ValueError("editable source does not match distribution metadata")
+    editable_root = _local_editable_root(direct_url)
+    record: Mapping[str, Any] | None = None
+    if editable_root is not None:
+        candidates = (editable_root / "src" / package_path, editable_root / package_path)
+        if module_path not in {Path(os.path.abspath(candidate)) for candidate in candidates}:
+            raise ValueError("editable module is outside its source ownership")
+        ownership = {"kind": "editable", "root": str(editable_root)}
+        ownership_root = editable_root
+    else:
+        expected_path = Path(os.path.abspath(distribution_root / package_path))
+        if module_path != expected_path:
+            raise ValueError("installed module requires one exact RECORD owner")
+        record_contents = _captured_metadata_bytes(
+            metadata_path, metadata_snapshot, "RECORD", required=True
+        )
+        record = _record_identity(record_contents, package_path)
+        record_path = Path(str(record.get("path") or ""))
+        if (
+            record_path.is_absolute()
+            or ".." in record_path.parts
+            or Path(os.path.abspath(distribution_root / record_path)) != module_path
+        ):
+            raise ValueError("installed module RECORD path is outside distribution ownership")
+        ownership = {"kind": "installed", "root": str(distribution_root)}
+        ownership_root = distribution_root
+    module_snapshot = _module_identity(module_path, ownership_root)
+    if record is not None and (
+        not isinstance(record.get("size"), int)
+        or isinstance(record.get("size"), bool)
+        or record.get("size") != module_snapshot["file"]["bytes"]
+        or not _record_hash_matches(module_snapshot["file"]["sha256"], record.get("hash"))
+    ):
+        raise ValueError("installed module does not match distribution RECORD metadata")
+    return {
+        "distribution": distribution,
+        "metadata_name": raw.get("name"),
+        "version": version,
+        "module_path": str(module_path),
+        "distribution_root": str(distribution_root),
+        "metadata_path": str(metadata_path),
+        "owned": True,
+        "ownership": ownership,
+        "record": dict(record) if record is not None else None,
+        "module_identity": module_snapshot,
+        "metadata_identity": metadata_snapshot,
+    }
+
+
+def capture_python_modules(raw_modules: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind target distributions to exact metadata, paths, bytes, and physical files."""
+    if not isinstance(raw_modules, Mapping) or set(raw_modules) != set(_PYTHON_MODULES):
+        raise PreflightError("python", "Target Python returned incomplete distribution identities")
+    try:
+        return {
+            key: _capture_python_module(raw_modules[key], distribution, package)
+            for key, (distribution, package) in _PYTHON_MODULES.items()
+        }
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise PreflightError(
+            "python", "Target Python imports are not owned by their selected distributions"
+        ) from exc
+
+
+def recapture_python_modules(expected: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recapture exact Python distribution state without importing changed modules."""
+    if not isinstance(expected, Mapping) or set(expected) != set(_PYTHON_MODULES):
+        return None
+    current: dict[str, Any] = {}
+    required = {
+        "distribution",
+        "metadata_name",
+        "version",
+        "module_path",
+        "distribution_root",
+        "metadata_path",
+        "owned",
+        "ownership",
+        "record",
+        "module_identity",
+        "metadata_identity",
+    }
+    try:
+        for key, (distribution, package) in _PYTHON_MODULES.items():
+            identity = expected[key]
+            if not isinstance(identity, Mapping) or set(identity) != required:
+                return None
+            if (
+                identity.get("distribution") != distribution
+                or identity.get("owned") is not True
+                or _normalized_distribution_name(identity.get("metadata_name"))
+                != _normalized_distribution_name(distribution)
+            ):
+                return None
+            _version_key(identity.get("version"))
+            module_path = _absolute_path(identity.get("module_path"))
+            distribution_root = _absolute_path(identity.get("distribution_root"))
+            metadata_path = _absolute_path(identity.get("metadata_path"))
+            ownership = identity.get("ownership")
+            if not isinstance(ownership, Mapping) or set(ownership) != {"kind", "root"}:
+                return None
+            ownership_root = _absolute_path(ownership.get("root"))
+            package_path = Path(*package.split(".")) / "__init__.py"
+            if ownership.get("kind") == "editable":
+                candidates = (
+                    ownership_root / "src" / package_path,
+                    ownership_root / package_path,
+                )
+                if module_path not in {Path(os.path.abspath(item)) for item in candidates}:
+                    return None
+            elif ownership.get("kind") == "installed":
+                if module_path != Path(os.path.abspath(distribution_root / package_path)):
+                    return None
+            else:
+                return None
+            module_snapshot = _module_identity(module_path, ownership_root)
+            metadata_snapshot = _metadata_identity(metadata_path, distribution_root)
+            record = identity.get("record")
+            if ownership.get("kind") == "installed" and (
+                not isinstance(record, Mapping)
+                or record.get("size") != module_snapshot["file"]["bytes"]
+                or not _record_hash_matches(module_snapshot["file"]["sha256"], record.get("hash"))
+            ):
+                return None
+            current[key] = {
+                **dict(identity),
+                "record": dict(record) if isinstance(record, Mapping) else None,
+                "module_identity": module_snapshot,
+                "metadata_identity": metadata_snapshot,
+            }
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return current if current == dict(expected) else None
+
+
 def _python_metadata(python_path: Path) -> dict[str, Any]:
     script = r"""
 import hashlib
 import importlib.metadata as metadata
 import importlib.resources as resources
 import json
+import os
 import pathlib
 import sys
-import urllib.parse
-import urllib.request
 
 import adobe.after_effects
 import dcc_mcp_aftereffects
 import dcc_mcp_core
 
 
-def describe(distribution_name, package_name, module):
+def describe(distribution_name, module):
     distribution = metadata.distribution(distribution_name)
-    module_path = pathlib.Path(module.__file__).resolve()
-    record_paths = {
-        pathlib.Path(distribution.locate_file(item)).resolve()
-        for item in tuple(distribution.files or ())
-    }
-    record_owned = module_path in record_paths
-    editable_root = None
-    try:
-        raw = distribution.read_text("direct_url.json")
-        direct_url = json.loads(raw) if raw else None
-        url = direct_url.get("url") if isinstance(direct_url, dict) else None
-        editable = (
-            direct_url.get("dir_info", {}).get("editable") is True
-            if isinstance(direct_url, dict)
-            else False
-        )
-        parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
-        if editable and parsed and parsed.scheme == "file" and not parsed.query and not parsed.fragment:
-            editable_root = pathlib.Path(
-                urllib.request.url2pathname(urllib.parse.unquote(parsed.path))
-            ).resolve()
-    except Exception:
-        editable_root = None
-    editable_owned = bool(
-        editable_root
-        and module_path
-        in {
-            editable_root / "src" / pathlib.Path(*package_name.split(".")) / "__init__.py",
-            editable_root / pathlib.Path(*package_name.split(".")) / "__init__.py",
-        }
-    )
+    module_path = pathlib.Path(os.path.abspath(module.__file__))
+    raw_direct_url = distribution.read_text("direct_url.json")
     return {
+        "name": distribution.metadata.get("Name"),
         "distribution": distribution_name,
         "version": distribution.version,
         "module_path": str(module_path),
-        "owned": record_owned or editable_owned,
+        "distribution_root": str(
+            pathlib.Path(os.path.abspath(distribution.locate_file("")))
+        ),
+        "metadata_path": str(pathlib.Path(os.path.abspath(distribution._path))),
+        "direct_url": json.loads(raw_direct_url) if raw_direct_url else None,
     }
 
 
@@ -808,10 +1188,10 @@ print(json.dumps({
     "python_executable": sys.executable,
     "modules": {
         "adapter": describe(
-            "dcc-mcp-aftereffects", "dcc_mcp_aftereffects", dcc_mcp_aftereffects
+            "dcc-mcp-aftereffects", dcc_mcp_aftereffects
         ),
-        "core": describe("dcc-mcp-core", "dcc_mcp_core", dcc_mcp_core),
-        "adobepy": describe("adobepy", "adobe.after_effects", adobe.after_effects),
+        "core": describe("dcc-mcp-core", dcc_mcp_core),
+        "adobepy": describe("adobepy", adobe.after_effects),
     },
     "core_schema": {
         "id": schema.get("$id"),
@@ -1048,7 +1428,6 @@ def resolve_install(
         if (
             not isinstance(module, dict)
             or module.get("distribution") != distribution
-            or module.get("owned") is not True
             or not trusted_module_path
         ):
             raise PreflightError(
@@ -1065,6 +1444,7 @@ def resolve_install(
         raise PreflightError(
             "core", "Target Core does not contain the canonical Install SOP schema"
         )
+    modules = capture_python_modules(modules)
     metadata["core"] = modules["core"]["version"]
     metadata["adobepy"] = modules["adobepy"]["version"]
     for name, minimum in (
@@ -1155,10 +1535,12 @@ __all__ = [
     "MIN_HOST_VERSION",
     "MIN_PYTHON_VERSION",
     "PreflightError",
+    "capture_python_modules",
     "default_extension_path",
     "default_state_dir",
     "host_process_executable",
     "recapture_host_attestation",
+    "recapture_python_modules",
     "reattest_bridge_cli",
     "resolve_install",
 ]

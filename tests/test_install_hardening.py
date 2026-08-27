@@ -5,6 +5,7 @@ import importlib.metadata
 import importlib.resources
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -32,6 +33,7 @@ from dcc_mcp_aftereffects.install_discovery import (
     _resolve_host,
     _trusted_host_version,
     _version_key,
+    capture_python_modules,
     reattest_host,
     resolve_install,
     trusted_host_attestation,
@@ -925,27 +927,283 @@ def test_verify_requires_exact_host_recapture_before_import_or_runtime_processes
     assert probe_calls == {"import": 0, "readiness": 0, "process": 0}
 
 
+def test_python_module_byte_drift_stops_before_staging_or_installer(
+    tmp_path: Path,
+) -> None:
+    module = tmp_path / "site-packages" / "adobe" / "after_effects" / "__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("TRUSTED = True\n", encoding="utf-8")
+    captured = {
+        key: {
+            "distribution": distribution,
+            "version": version,
+            "module_path": str(module),
+            "owned": True,
+        }
+        for key, distribution, version in (
+            ("adapter", "dcc-mcp-aftereffects", "0.7.0"),
+            ("core", "dcc-mcp-core", "0.20.21"),
+            ("adobepy", "adobepy", "0.6.2"),
+        )
+    }
+    resolved = replace(resolved_install(tmp_path), python_modules=captured)
+    module.write_text("FOREIGN_BUT_IMPORTABLE = True\n", encoding="utf-8")
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "same-bytes-independent-file",
+        "different-bytes",
+        "hardlink",
+        "link-or-reparse",
+        "module-path",
+        "metadata-bytes",
+        "metadata-independent-file",
+    ],
+)
+def test_exact_python_identity_drift_has_zero_install_mutation(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    modules = deepcopy(dict(resolved.python_modules))
+    adapter = modules["adapter"]
+    module = Path(adapter["module_path"])
+    metadata = Path(adapter["metadata_path"]) / "METADATA"
+    if drift == "same-bytes-independent-file":
+        replacement = module.with_suffix(".replacement")
+        replacement.write_bytes(module.read_bytes())
+        os.replace(replacement, module)
+    elif drift == "different-bytes":
+        module.write_text("FOREIGN_BUT_IMPORTABLE = True\n", encoding="utf-8")
+    elif drift == "hardlink":
+        foreign = module.with_suffix(".foreign")
+        foreign.write_bytes(module.read_bytes())
+        module.unlink()
+        os.link(foreign, module)
+    elif drift == "link-or-reparse":
+        foreign = module.parent.with_name("foreign-adapter")
+        shutil.copytree(module.parent, foreign)
+        shutil.rmtree(module.parent)
+        if os.name == "nt":
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(module.parent), str(foreign)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert linked.returncode == 0, linked.stderr
+        else:
+            module.parent.symlink_to(foreign, target_is_directory=True)
+    elif drift == "module-path":
+        foreign = module.with_suffix(".foreign")
+        foreign.write_bytes(module.read_bytes())
+        adapter["module_path"] = str(foreign)
+        resolved = replace(resolved, python_modules=modules)
+    elif drift == "metadata-bytes":
+        metadata.write_text("Name: foreign\nVersion: 99\n", encoding="utf-8")
+    elif drift == "metadata-independent-file":
+        replacement = metadata.with_suffix(".replacement")
+        replacement.write_bytes(metadata.read_bytes())
+        os.replace(replacement, metadata)
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+    assert not list(resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.stage-*"))
+
+
+def test_editable_source_replacement_has_zero_install_mutation(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    raw_modules: dict[str, object] = {}
+    source = tmp_path / "editable-adapter"
+    source_module = source / "src" / "dcc_mcp_aftereffects" / "__init__.py"
+    source_module.parent.mkdir(parents=True)
+    installed_adapter = Path(resolved.python_modules["adapter"]["module_path"])
+    source_module.write_bytes(installed_adapter.read_bytes())
+    editable = {"url": source.as_uri(), "dir_info": {"editable": True}}
+    metadata_path = Path(resolved.python_modules["adapter"]["metadata_path"])
+    (metadata_path / "direct_url.json").write_text(json.dumps(editable), encoding="utf-8")
+    for key, identity in resolved.python_modules.items():
+        raw_modules[key] = {
+            "name": identity["metadata_name"],
+            "distribution": identity["distribution"],
+            "version": identity["version"],
+            "module_path": str(source_module) if key == "adapter" else identity["module_path"],
+            "distribution_root": identity["distribution_root"],
+            "metadata_path": identity["metadata_path"],
+            "records": [] if key == "adapter" else [identity["record"]],
+            "direct_url": editable if key == "adapter" else None,
+        }
+    resolved = replace(resolved, python_modules=capture_python_modules(raw_modules))
+    replacement = source.with_name("editable-adapter-replacement")
+    shutil.copytree(source, replacement)
+    shutil.rmtree(source)
+    os.replace(replacement, source)
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT
+    assert report["verify"]["failure_stage"] == "python_attestation"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+    assert not list(resolved.extension_path.parent.glob(f".{resolved.extension_path.name}.stage-*"))
+
+
+def test_python_capture_binds_name_and_version_to_metadata_bytes(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    raw_modules: dict[str, object] = {}
+    for key, identity in resolved.python_modules.items():
+        raw_modules[key] = {
+            "name": identity["metadata_name"],
+            "distribution": identity["distribution"],
+            "version": identity["version"],
+            "module_path": identity["module_path"],
+            "distribution_root": identity["distribution_root"],
+            "metadata_path": identity["metadata_path"],
+            "records": [identity["record"]],
+            "direct_url": None,
+        }
+    adapter_metadata = Path(resolved.python_modules["adapter"]["metadata_path"]) / "METADATA"
+    adapter_metadata.write_text(
+        "Metadata-Version: 2.4\nName: foreign-package\nVersion: 99\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PreflightError, match="owned by their selected distributions"):
+        capture_python_modules(raw_modules)
+
+
 def test_ready_probe_without_exact_runtime_identity_fails_closed(tmp_path: Path) -> None:
     resolved = resolved_install(tmp_path)
-    dependencies = healthy_dependencies(BridgeRunner())
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
     dependencies.readiness_probe = lambda _resolved: AfterEffectsStatus(
         True, version=resolved.host_version, target=resolved.target
     )
 
-    _, install_exit = run_lifecycle(
+    report, install_exit = run_lifecycle(
         InstallRequest("install", as_json=True, yes=True),
         resolved=resolved,
         dependencies=dependencies,
     )
-    report, exit_code = run_lifecycle(
-        InstallRequest("verify", as_json=True),
+    status_report, status_exit = run_lifecycle(
+        InstallRequest("status", as_json=True),
         resolved=resolved,
         dependencies=dependencies,
     )
 
-    assert install_exit != EXIT_OK
-    assert exit_code == EXIT_VERIFY
+    assert install_exit == EXIT_VERIFY
+    assert report["status"] == "failed"
     assert report["verify"]["failure_stage"] == "readiness_identity"
+    assert len(runner.calls) == 1
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+    assert status_exit == EXIT_OK
+    assert status_report["installation_state"] == "fresh"
+
+
+@pytest.mark.parametrize(
+    "process_identity",
+    [
+        None,
+        {},
+        {"ok": False},
+        {
+            "ok": True,
+            "executable": "C:/foreign/AfterFX.exe",
+            "process_start_identity": "test-host-start:41001",
+        },
+    ],
+    ids=["missing", "empty", "unavailable", "foreign-executable"],
+)
+def test_invalid_process_attestation_rolls_back_the_fresh_install(
+    tmp_path: Path, process_identity: object
+) -> None:
+    resolved = resolved_install(tmp_path)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+    dependencies.process_probe = lambda _pid: process_identity  # type: ignore[assignment]
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    status_report, status_exit = run_lifecycle(
+        InstallRequest("status", as_json=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "readiness_identity"
+    assert len(runner.calls) == 1
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+    assert status_exit == EXIT_OK
+    assert status_report["installation_state"] == "fresh"
+
+
+def test_process_attestation_failure_rolls_back_the_fresh_install(tmp_path: Path) -> None:
+    resolved = resolved_install(tmp_path)
+    runner = BridgeRunner()
+    dependencies = healthy_dependencies(runner)
+
+    def unavailable(_pid: int):
+        raise OSError("simulated process attestation failure")
+
+    dependencies.process_probe = unavailable
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+    status_report, status_exit = run_lifecycle(
+        InstallRequest("status", as_json=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_VERIFY
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "readiness_identity"
+    assert len(runner.calls) == 1
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+    assert status_exit == EXIT_OK
+    assert status_report["installation_state"] == "fresh"
 
 
 @pytest.mark.parametrize(
