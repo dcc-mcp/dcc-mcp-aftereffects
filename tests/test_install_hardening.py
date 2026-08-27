@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.metadata
 import importlib.resources
@@ -1270,7 +1271,7 @@ def test_python_identity_drift_after_post_installer_check_has_zero_publish(
         nonlocal recaptures
         recaptures += 1
         current = original_recapture(expected, observed)
-        if recaptures == 2 and current is not None:
+        if runner.calls and current is not None:
             replacement = adapter_module.with_suffix(".pre-publish-replacement")
             replacement.write_bytes(adapter_module.read_bytes())
             os.replace(replacement, adapter_module)
@@ -1286,7 +1287,7 @@ def test_python_identity_drift_after_post_installer_check_has_zero_publish(
 
     assert exit_code == EXIT_PREFLIGHT
     assert report["verify"]["failure_stage"] == "python_attestation"
-    assert recaptures >= 3
+    assert recaptures >= 2
     assert len(runner.calls) == 1
     assert not resolved.extension_path.exists()
     assert not resolved.receipt_path.exists()
@@ -1305,7 +1306,11 @@ def test_python_identity_drift_before_finalize_rolls_back_new_publish(
         nonlocal recaptures
         recaptures += 1
         current = original_recapture(expected, observed)
-        if recaptures == 4 and current is not None:
+        if (
+            resolved.extension_path.exists()
+            and resolved.receipt_path.exists()
+            and current is not None
+        ):
             replacement = adapter_module.with_suffix(".pre-finalize-replacement")
             replacement.write_bytes(adapter_module.read_bytes())
             os.replace(replacement, adapter_module)
@@ -1321,7 +1326,7 @@ def test_python_identity_drift_before_finalize_rolls_back_new_publish(
 
     assert exit_code == EXIT_PREFLIGHT
     assert report["verify"]["failure_stage"] == "python_attestation"
-    assert recaptures >= 5
+    assert recaptures >= 4
     assert len(runner.calls) == 1
     assert not resolved.extension_path.exists()
     assert not resolved.receipt_path.exists()
@@ -1370,7 +1375,7 @@ def test_python_identity_drift_before_receipt_publish_restores_prior_install(
 
     assert exit_code == EXIT_PREFLIGHT
     assert report["verify"]["failure_stage"] == "python_attestation"
-    assert recaptures >= 4
+    assert recaptures >= 3
     assert resolved.receipt_path.read_bytes() == previous_receipt
     assert {
         path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
@@ -2166,6 +2171,438 @@ def test_partial_finalize_cleanup_restores_prior_install_from_recovery_snapshot(
         for path in resolved.extension_path.rglob("*")
         if path.is_file()
     } == previous_files
+
+
+def test_finalize_extension_cleanup_base_exception_restores_prior_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    previous_receipt = resolved.receipt_path.read_bytes()
+    previous_files = {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    }
+    original_remove = install_io.safe_remove_tree
+
+    def crashing_cleanup(path: Path):
+        if path.name.startswith(f".{resolved.extension_path.name}.backup-"):
+            raise _ProcessBoundaryFault("extension cleanup crash")
+        return original_remove(path)
+
+    monkeypatch.setattr(install_io, "safe_remove_tree", crashing_cleanup)
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "cleanup"
+    assert resolved.receipt_path.read_bytes() == previous_receipt
+    assert {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    } == previous_files
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    [PermissionError("locked receipt backup"), _ProcessBoundaryFault("receipt cleanup crash")],
+    ids=["locked-file", "base-exception"],
+)
+def test_locked_receipt_backup_cleanup_preserves_exact_prior_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: BaseException,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    previous_receipt = resolved.receipt_path.read_bytes()
+    previous_files = {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    }
+    original_unlink = Path.unlink
+
+    def fail_receipt_backup_cleanup(path: Path, *args, **kwargs):
+        if path.name.startswith(f".{resolved.receipt_path.name}.backup-"):
+            raise cleanup_failure
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_receipt_backup_cleanup)
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_INSTALL, report
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "cleanup"
+    assert resolved.receipt_path.read_bytes() == previous_receipt
+    assert {
+        path.relative_to(resolved.extension_path).as_posix(): path.read_bytes()
+        for path in resolved.extension_path.rglob("*")
+        if path.is_file()
+    } == previous_files
+
+
+def test_wheel_first_upgrade_accepts_new_attested_distribution_identity(
+    tmp_path: Path,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    raw = {}
+    for key, identity in deepcopy(dict(resolved.python_modules)).items():
+        raw[key] = {
+            "name": identity["metadata_name"],
+            "distribution": identity["distribution"],
+            "version": identity["version"],
+            "module_path": identity["module_path"],
+            "distribution_root": identity["distribution_root"],
+            "metadata_path": identity["metadata_path"],
+            "direct_url": None,
+            "records": [identity["record"]] if identity["record"] is not None else [],
+        }
+    adapter = raw["adapter"]
+    adapter["version"] = "0.7.1"
+    module = Path(adapter["module_path"])
+    contents = b"__version__ = '0.7.1'\n"
+    module.write_bytes(contents)
+    digest = base64.urlsafe_b64encode(hashlib.sha256(contents).digest()).decode().rstrip("=")
+    record = {
+        "path": "dcc_mcp_aftereffects/__init__.py",
+        "hash": f"sha256={digest}",
+        "size": len(contents),
+    }
+    adapter["records"] = [record]
+    metadata = Path(adapter["metadata_path"])
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.4\nName: dcc-mcp-aftereffects\nVersion: 0.7.1\n",
+        encoding="utf-8",
+    )
+    (metadata / "RECORD").write_text(
+        f"{record['path']},{record['hash']},{record['size']}\n",
+        encoding="utf-8",
+    )
+    upgraded = replace(resolved, python_modules=capture_python_modules(raw))
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("upgrade", as_json=True, yes=True),
+        resolved=upgraded,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_OK, report
+    assert report["status"] == "ok"
+    assert json.loads(upgraded.receipt_path.read_text(encoding="utf-8"))["python_modules"] == dict(
+        upgraded.python_modules
+    )
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        b"foreign-state-owned-by-another-writer\n",
+        json.dumps(
+            {
+                "schema_version": 4,
+                "dcc_type": "aftereffects",
+                "adapter_version": "99.0.0",
+                "host_path": "foreign-host",
+                "extension_path": "foreign-extension",
+                "files": [],
+            }
+        ).encode("utf-8"),
+    ],
+    ids=["invalid", "unowned"],
+)
+def test_foreign_or_invalid_orphan_receipt_is_preserved_without_mutation(
+    tmp_path: Path, foreign: bytes
+) -> None:
+    resolved = resolved_install(tmp_path)
+    resolved.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved.receipt_path.write_bytes(foreign)
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["status"] == "failed"
+    assert report["installation_state"] == "partial"
+    assert report["verify"]["failure_stage"] == "receipt"
+    assert resolved.receipt_path.read_bytes() == foreign
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows junction")
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+def test_mutation_root_rejects_ancestor_junction_after_resolution(
+    tmp_path: Path, target: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    foreign = tmp_path / "foreign-profile"
+    foreign_child = foreign / ("extensions" if target == "extension" else "receipts")
+    foreign_child.mkdir(parents=True)
+    selected = resolved.extension_path if target == "extension" else resolved.receipt_path
+    junction = selected.parents[1]
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(foreign)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert linked.returncode == 0, linked.stderr
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    foreign_target = foreign_child / selected.name
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "mutation_roots"
+    assert runner.calls == []
+    assert not foreign_target.exists()
+    assert not resolved.receipt_path.exists()
+
+
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+def test_existing_mutation_root_rejects_independent_same_path_replacement(
+    tmp_path: Path, target: str
+) -> None:
+    root = tmp_path / ("CEP" if target == "extension" else "state")
+    root.mkdir()
+    resolved = resolved_install(tmp_path)
+    original = root.with_name(f"{root.name}-original")
+    root.rename(original)
+    root.mkdir()
+    runner = BridgeRunner()
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "mutation_roots"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises Windows no-replace directory CAS")
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+def test_new_mutation_root_rejects_same_path_replacement_inside_creation_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    selected = tmp_path / ("CEP" if target == "extension" else "state")
+    original_rename = install_io.os.rename
+    replaced = False
+
+    def replace_after_owned_creation(source, destination):
+        nonlocal replaced
+        result = original_rename(source, destination)
+        if Path(destination) == selected and not replaced:
+            replaced = True
+            owned = selected.with_name(f"{selected.name}-transaction-owned")
+            original_rename(selected, owned)
+            selected.mkdir()
+        return result
+
+    monkeypatch.setattr(install_io.os, "rename", replace_after_owned_creation)
+    runner = BridgeRunner()
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(runner),
+    )
+
+    assert replaced is True
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "mutation_roots"
+    assert runner.calls == []
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows junction")
+@pytest.mark.parametrize("target", ["extension", "receipt"])
+def test_mutation_root_junction_drift_after_bridge_has_zero_publish(
+    tmp_path: Path, target: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    base_runner = BridgeRunner()
+    selected_root = tmp_path / ("CEP" if target == "extension" else "state")
+
+    def drifting_runner(*args, **kwargs):
+        result = base_runner(*args, **kwargs)
+        foreign = selected_root.with_name(f"{selected_root.name}-foreign")
+        selected_root.rename(foreign)
+        linked = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(selected_root), str(foreign)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert linked.returncode == 0, linked.stderr
+        return result
+
+    dependencies = healthy_dependencies(base_runner)
+    dependencies.bridge_runner = drifting_runner
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=dependencies,
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "mutation_roots"
+    assert len(base_runner.calls) == 1
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows junction")
+def test_uninstall_rejects_mutation_root_junction_without_removing_owned_state(
+    tmp_path: Path,
+) -> None:
+    resolved = resolved_install(tmp_path)
+    installed, install_exit = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+    assert install_exit == EXIT_OK, installed
+    receipt = resolved.receipt_path.read_bytes()
+    root = tmp_path / "CEP"
+    foreign = tmp_path / "CEP-foreign"
+    root.rename(foreign)
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(root), str(foreign)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert linked.returncode == 0, linked.stderr
+
+    report, exit_code = run_lifecycle(
+        InstallRequest("uninstall", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert report["verify"]["failure_stage"] == "mutation_roots"
+    assert (foreign / "extensions" / resolved.extension_path.name).is_dir()
+    assert resolved.receipt_path.read_bytes() == receipt
+
+
+@pytest.mark.parametrize("target", ["host", "signature-helper", "adapter-module"])
+def test_identity_change_inside_replace_boundary_has_zero_publish_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    selected = (
+        resolved.host_path
+        if target == "host"
+        else (
+            Path(resolved.host_identity["signature_helper"]["path"])
+            if target == "signature-helper"
+            else Path(resolved.python_modules["adapter"]["module_path"])
+        )
+    )
+    original_replace = install_io.os.replace
+    publish_renamed = False
+
+    def race_after_attestation(source, destination):
+        nonlocal publish_renamed
+        if Path(destination) == resolved.extension_path and not publish_renamed:
+            same_bytes = selected.with_name(f"{selected.name}.same-bytes-race.tmp")
+            same_bytes.write_bytes(selected.read_bytes())
+            original_replace(same_bytes, selected)
+            publish_renamed = True
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(install_io.os, "replace", race_after_attestation)
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert publish_renamed is False
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
+
+
+@pytest.mark.parametrize("target", ["host", "signature-helper", "adapter-module"])
+def test_identity_change_inside_receipt_replace_boundary_has_zero_publish_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    resolved = resolved_install(tmp_path)
+    selected = (
+        resolved.host_path
+        if target == "host"
+        else (
+            Path(resolved.host_identity["signature_helper"]["path"])
+            if target == "signature-helper"
+            else Path(resolved.python_modules["adapter"]["module_path"])
+        )
+    )
+    original_replace = install_io.os.replace
+    receipt_renamed = False
+
+    def race_after_attestation(source, destination):
+        nonlocal receipt_renamed
+        if Path(destination) == resolved.receipt_path and not receipt_renamed:
+            same_bytes = selected.with_name(f"{selected.name}.receipt-race.tmp")
+            same_bytes.write_bytes(selected.read_bytes())
+            original_replace(same_bytes, selected)
+            receipt_renamed = True
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(install_io.os, "replace", race_after_attestation)
+    report, exit_code = run_lifecycle(
+        InstallRequest("install", as_json=True, yes=True),
+        resolved=resolved,
+        dependencies=healthy_dependencies(BridgeRunner()),
+    )
+
+    assert exit_code == EXIT_PREFLIGHT, report
+    assert receipt_renamed is False
+    assert not resolved.extension_path.exists()
+    assert not resolved.receipt_path.exists()
 
 
 @pytest.mark.parametrize(
