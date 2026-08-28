@@ -44,7 +44,7 @@ arguments, reports, logs, receipts, or PR text.
 
 ## Supported versions
 
-Current adapter release: **0.7.0** <!-- x-release-please-version -->
+Current adapter release: **0.7.1** <!-- x-release-please-version -->
 
 | Adapter | dcc-mcp-core | After Effects | Python | Platform |
 |---|---|---|---|---|

@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.0...v0.7.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* bind install mutations to verified identities ([cbf84b4](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/cbf84b45d0132b08b9dadefabece36233eacd10f))
+* bind install targets to exact objects ([9bdae7e](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/9bdae7e11261d83af99f6d0cfa70df71330ec96d))
+* bind install transaction identities ([a355023](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/a35502328a88f0ebb0dafd089c546c6251457feb))
+* bind installer package and process identities ([66277de](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/66277de7193ca7784cc6338deb6ece70f87185c5))
+* bind Windows trust to helper identity ([8615142](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/8615142c2cdb24b291a652bc4a1ba40112d962e6))
+* close install transaction races ([c520cad](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/c520cadfb285c114b8d1deaafe3f716a11399bd3))
+* harden install attestation transactions ([432cd87](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/432cd87682c143329e3f3fc5176bccdbb6e64329))
+* preserve install rollback ownership ([d99723c](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/d99723c0dbf9d841a6ab837771de0c17a1e7a1d6))
+* require exact host attestation recapture ([9b69edc](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/9b69edc75082c920e15ac0f5882085432918d588))
+* retain exact install object leases ([754778c](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/754778c25562d3a5e6fd282f4d45c20d6e6fa19f))
+* retain payload ownership through deletion ([4934040](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/49340408df31feac621b94751df883719948c559))
+* retain payload ownership through transactions ([78c75d3](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/78c75d3bfafbcefeafc152d11ef03716f9864811))
+* stabilize POSIX mutation root identity ([4824628](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/4824628a0e24ee8666ac4f587af82bbcbe95e1bd))
+
 ## [0.7.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.6.0...v0.7.0) (2026-08-25)
 
 
