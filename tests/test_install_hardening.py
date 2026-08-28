@@ -2407,19 +2407,20 @@ def test_partial_finalize_cleanup_restores_prior_install_from_recovery_snapshot(
         for path in resolved.extension_path.rglob("*")
         if path.is_file()
     }
-    original_remove = install_io.safe_remove_tree
+    original_delete = install_io._delete_leased_tree
     failed_once = False
 
-    def partial_backup_cleanup(path: Path):
+    def partial_backup_cleanup(lease, **kwargs):
         nonlocal failed_once
+        path = lease.path
         if not failed_once and path.name.startswith(f".{resolved.extension_path.name}.backup-"):
             failed_once = True
             victim = path / "manifest.xml"
             victim.unlink(missing_ok=True)
             return {"success": False, "errors": ["simulated partial cleanup"]}
-        return original_remove(path)
+        return original_delete(lease, **kwargs)
 
-    monkeypatch.setattr(install_io, "safe_remove_tree", partial_backup_cleanup)
+    monkeypatch.setattr(install_io, "_delete_leased_tree", partial_backup_cleanup)
     report, exit_code = run_lifecycle(
         InstallRequest("upgrade", as_json=True, yes=True),
         resolved=resolved,
@@ -2454,14 +2455,15 @@ def test_finalize_extension_cleanup_base_exception_restores_prior_install(
         for path in resolved.extension_path.rglob("*")
         if path.is_file()
     }
-    original_remove = install_io.safe_remove_tree
+    original_delete = install_io._delete_leased_tree
 
-    def crashing_cleanup(path: Path):
+    def crashing_cleanup(lease, **kwargs):
+        path = lease.path
         if path.name.startswith(f".{resolved.extension_path.name}.backup-"):
             raise _ProcessBoundaryFault("extension cleanup crash")
-        return original_remove(path)
+        return original_delete(lease, **kwargs)
 
-    monkeypatch.setattr(install_io, "safe_remove_tree", crashing_cleanup)
+    monkeypatch.setattr(install_io, "_delete_leased_tree", crashing_cleanup)
     report, exit_code = run_lifecycle(
         InstallRequest("upgrade", as_json=True, yes=True),
         resolved=resolved,
@@ -3326,16 +3328,17 @@ def test_uninstall_blocks_same_content_checked_object_swap(
 
         monkeypatch.setattr(install_io, "_write_recovery_archive", racing_archive)
     else:
-        original_cleanup = install_io.safe_remove_tree
+        original_cleanup = install_io._delete_leased_tree
 
-        def racing_cleanup(path: Path):
+        def racing_cleanup(lease, **kwargs):
+            path = lease.path
             if not attempted and path.name.startswith(
                 f".{resolved.extension_path.name}.uninstall-"
             ):
                 attempt_swap(path if target == "extension" else resolved.receipt_path)
-            return original_cleanup(path)
+            return original_cleanup(lease, **kwargs)
 
-        monkeypatch.setattr(install_io, "safe_remove_tree", racing_cleanup)
+        monkeypatch.setattr(install_io, "_delete_leased_tree", racing_cleanup)
 
     report, exit_code = run_lifecycle(
         InstallRequest("uninstall", as_json=True, yes=True),

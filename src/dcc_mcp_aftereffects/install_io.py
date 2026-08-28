@@ -1183,7 +1183,84 @@ def _require_payload_file_leases(
         )
 
 
-def _delete_leased_tree(lease: _ExactObjectLease) -> dict[str, Any]:
+def _delete_leased_tree(
+    lease: _ExactObjectLease,
+    *,
+    payload_manifest: list[dict[str, Any]] | None = None,
+    payload_identities: Mapping[
+        str,
+        tuple[int, int, int, int, int, int, int, int, int, int],
+    ]
+    | None = None,
+) -> dict[str, Any]:
+    if payload_manifest is not None or payload_identities is not None:
+        if payload_manifest is None or payload_identities is None:
+            raise IdentityAttestationError(
+                "The destructive payload closure is incomplete",
+                stage="identity_attestation",
+            )
+        deletion_leases: dict[str, _ExactObjectLease] = {}
+        try:
+            expected_receipt = {
+                "files": payload_manifest,
+                "manifest_sha256": _manifest_digest(payload_manifest),
+            }
+            if not receipt_files_match(expected_receipt, lease.path):
+                raise IdentityAttestationError(
+                    "The extension payload changed before destructive cleanup",
+                    stage="identity_attestation",
+                )
+            for relative in payload_identities:
+                deletion_leases[relative] = _ExactObjectLease.acquire(lease.path / Path(relative))
+            _require_payload_file_leases(
+                lease.path,
+                payload_manifest,
+                payload_identities,
+                deletion_leases,
+            )
+            for relative in sorted(deletion_leases, reverse=True):
+                deletion_leases[relative].delete()
+                deletion_leases.pop(relative)
+            symlinks: list[Path] = []
+            directories: list[Path] = []
+            for entry in payload_manifest:
+                relative = _safe_relative(entry.get("path"))
+                if relative is None:
+                    raise IdentityAttestationError(
+                        "The destructive payload closure contains an invalid path",
+                        stage="identity_attestation",
+                    )
+                if entry.get("type") == "symlink":
+                    symlinks.append(relative)
+                elif entry.get("type") == "directory":
+                    directories.append(relative)
+            for relative in symlinks:
+                path = lease.path / relative
+                if not path.is_symlink():
+                    raise IdentityAttestationError(
+                        "The payload link changed before destructive cleanup",
+                        stage="identity_attestation",
+                    )
+                path.unlink()
+            for relative in sorted(
+                directories,
+                key=lambda path: (len(path.parts), path.as_posix()),
+                reverse=True,
+            ):
+                (lease.path / relative).rmdir()
+            lease.delete()
+            return {"success": True, "errors": []}
+        except IdentityAttestationError as exc:
+            _close_leases_preserving(exc, *deletion_leases.values())
+            return {
+                "success": False,
+                "ownership_indeterminate": True,
+                "errors": [str(exc)],
+            }
+        except OSError as exc:
+            _close_leases_preserving(exc, *deletion_leases.values())
+            return {"success": False, "errors": [str(exc)]}
+
     cleanup = safe_remove_tree(lease.path)
     if lease.path.exists():
         try:
@@ -1261,6 +1338,15 @@ class InstallTransaction:
         tuple[int, int, int, int, int, int, int, int, int, int],
     ] = field(default_factory=dict)
     payload_leases: dict[str, _ExactObjectLease] = field(default_factory=dict)
+    retained_cleanup_paths: tuple[Path, ...] = ()
+
+    def _retain_indeterminate_extension(self) -> None:
+        if self.committed_extension_lease is None:
+            return
+        retained = self.committed_extension_lease.path
+        self.committed_extension_lease.close()
+        self.committed_extension_lease = None
+        self.retained_cleanup_paths += (retained,)
 
     @staticmethod
     def _require_attestation(
@@ -1425,16 +1511,32 @@ class InstallTransaction:
                         raise OSError("committed extension object lease is unavailable")
                     _close_payload_file_leases(self.payload_leases)
                     self.committed_extension_lease.rename(failed)
-                    cleanup = _delete_leased_tree(self.committed_extension_lease)
+                    cleanup = _delete_leased_tree(
+                        self.committed_extension_lease,
+                        payload_manifest=self.payload_manifest,
+                        payload_identities=self.payload_identities,
+                    )
                     if not cleanup.get("success"):
-                        raise OSError("committed extension object could not be retired")
-                    self.committed_extension_lease = None
+                        if cleanup.get("ownership_indeterminate"):
+                            self._retain_indeterminate_extension()
+                        else:
+                            raise OSError("committed extension object could not be retired")
+                    else:
+                        self.committed_extension_lease = None
                 elif self.committed_extension_lease is not None:
                     _close_payload_file_leases(self.payload_leases)
-                    cleanup = _delete_leased_tree(self.committed_extension_lease)
+                    cleanup = _delete_leased_tree(
+                        self.committed_extension_lease,
+                        payload_manifest=self.payload_manifest,
+                        payload_identities=self.payload_identities,
+                    )
                     if not cleanup.get("success"):
-                        raise OSError("staged extension object could not be retired")
-                    self.committed_extension_lease = None
+                        if cleanup.get("ownership_indeterminate"):
+                            self._retain_indeterminate_extension()
+                        else:
+                            raise OSError("staged extension object could not be retired")
+                    else:
+                        self.committed_extension_lease = None
                 if self.committed_receipt_lease is not None:
                     self._require_mutation_roots()
                     self.committed_receipt_lease.delete()
@@ -1504,9 +1606,15 @@ class InstallTransaction:
             ):
                 self._require_mutation_roots()
                 _close_payload_file_leases(self.payload_leases)
-                cleanup = _delete_leased_tree(self.committed_extension_lease)
+                cleanup = _delete_leased_tree(
+                    self.committed_extension_lease,
+                    payload_manifest=self.payload_manifest,
+                    payload_identities=self.payload_identities,
+                )
                 if cleanup.get("success"):
                     self.committed_extension_lease = None
+                elif cleanup.get("ownership_indeterminate"):
+                    self._retain_indeterminate_extension()
             if (
                 self.closed
                 and self.recovery_archive is None
@@ -1521,9 +1629,18 @@ class InstallTransaction:
                     self.previous_payload_identities,
                     self.previous_payload_leases,
                 )
-                cleanup = _delete_leased_tree(self.previous_extension_lease)
+                cleanup = _delete_leased_tree(
+                    self.previous_extension_lease,
+                    payload_manifest=self.previous_payload_manifest,
+                    payload_identities=self.previous_payload_identities,
+                )
                 if cleanup.get("success"):
                     self.previous_extension_lease = None
+                elif cleanup.get("ownership_indeterminate"):
+                    retained = self.previous_extension_lease.path
+                    self.previous_extension_lease.close()
+                    self.previous_extension_lease = None
+                    self.retained_cleanup_paths += (retained,)
             if self.closed and self.recovery_archive is not None:
                 try:
                     self._require_mutation_roots()
@@ -1593,13 +1710,22 @@ class InstallTransaction:
                         self.previous_payload_identities,
                         self.previous_payload_leases,
                     )
-                    cleanup = _delete_leased_tree(self.previous_extension_lease)
+                    cleanup = _delete_leased_tree(
+                        self.previous_extension_lease,
+                        payload_manifest=self.previous_payload_manifest,
+                        payload_identities=self.previous_payload_identities,
+                    )
                 except IdentityAttestationError:
                     raise
                 except BaseException as exc:
                     raise RestartRequired(
                         "The verified previous extension backup could not be cleaned safely"
                     ) from exc
+                if cleanup.get("ownership_indeterminate"):
+                    raise IdentityAttestationError(
+                        "The previous payload ownership became indeterminate before cleanup",
+                        stage="identity_attestation",
+                    )
                 if not cleanup.get("success"):
                     raise RestartRequired(
                         "The verified previous extension backup is locked until After Effects "
@@ -1900,6 +2026,8 @@ def commit_staged_install(
             transaction.rollback()
         except BaseException:
             exc.rollback_failed = True
+        if transaction.retained_cleanup_paths:
+            exc.retained_cleanup_paths = transaction.retained_cleanup_paths
         raise
     except (OSError, TypeError, ValueError) as exc:
         try:
@@ -2139,12 +2267,7 @@ def _remove_receipted_install(
         tuple[int, int, int, int, int, int, int, int, int, int],
     ] = {}
     payload_leases: dict[str, _ExactObjectLease] = {}
-
-    def cleanup(path: Path) -> bool:
-        if not path.exists() and not path.is_symlink():
-            return True
-        result = safe_remove_tree(path)
-        return bool(result.get("success")) and not path.exists()
+    retained_cleanup_paths: list[Path] = []
 
     def restore() -> bool:
         nonlocal extension_lease, receipt_lease
@@ -2158,7 +2281,9 @@ def _remove_receipted_install(
                         payload_leases,
                     )
                 except IdentityAttestationError:
-                    pass
+                    retained_cleanup_paths.append(extension_lease.path)
+                    extension_lease.close()
+                    extension_lease = None
                 else:
                     _prepare_payload_root_for_deletion(
                         extension_lease.path,
@@ -2166,12 +2291,24 @@ def _remove_receipted_install(
                         payload_identities,
                         payload_leases,
                     )
-                    cleanup_result = _delete_leased_tree(extension_lease)
+                    cleanup_result = _delete_leased_tree(
+                        extension_lease,
+                        payload_manifest=payload_manifest,
+                        payload_identities=payload_identities,
+                    )
                     if not cleanup_result.get("success"):
-                        raise OSError("After Effects failed destination could not be quarantined")
-                    extension_lease = None
-            elif not cleanup(destination):
-                raise OSError("After Effects failed destination could not be quarantined")
+                        if cleanup_result.get("ownership_indeterminate"):
+                            retained_cleanup_paths.append(extension_lease.path)
+                            extension_lease.close()
+                            extension_lease = None
+                        else:
+                            raise OSError(
+                                "After Effects failed destination could not be quarantined"
+                            )
+                    else:
+                        extension_lease = None
+            elif destination.exists() or destination.is_symlink():
+                raise OSError("An unleased destination appeared during uninstall recovery")
             if receipt is None:
                 raise OSError("After Effects uninstall recovery receipt is unavailable")
             if recovery_lease is None:
@@ -2271,7 +2408,16 @@ def _remove_receipted_install(
             payload_identities,
             payload_leases,
         )
-        cleanup_result = _delete_leased_tree(extension_lease)
+        cleanup_result = _delete_leased_tree(
+            extension_lease,
+            payload_manifest=payload_manifest,
+            payload_identities=payload_identities,
+        )
+        if cleanup_result.get("ownership_indeterminate"):
+            raise IdentityAttestationError(
+                "The uninstall payload ownership became indeterminate before deletion",
+                stage="identity_attestation",
+            )
         if not cleanup_result.get("success"):
             raise PermissionError("After Effects extension cleanup is locked")
         extension_lease = None
@@ -2284,6 +2430,8 @@ def _remove_receipted_install(
             retire_recovery_preserving(exc)
         elif not restore():
             exc.rollback_failed = True
+        if retained_cleanup_paths:
+            exc.retained_cleanup_paths = tuple(retained_cleanup_paths)
         raise
     except (InstallIoError, RestartRequired):
         raise
