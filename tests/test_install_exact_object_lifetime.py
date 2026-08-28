@@ -465,6 +465,94 @@ def test_payload_manifest_rejects_a_hardlinked_file(tmp_path: Path) -> None:
     assert external.read_bytes() == b"shared payload\n"
 
 
+def test_existing_payload_hardlink_fails_before_any_commit_callback(
+    tmp_path: Path,
+) -> None:
+    staged, destination, receipt_path = _prior_transaction_paths(tmp_path)
+    prior_child = destination / "manifest.xml"
+    external_hardlink = tmp_path / "external-hardlink.xml"
+    os.link(prior_child, external_hardlink)
+    callback_called = False
+
+    def forbidden_callback(path: Path, receipt: object) -> None:
+        nonlocal callback_called
+        callback_called = True
+        install_io.write_receipt(path, receipt)  # type: ignore[arg-type]
+
+    with pytest.raises(install_io.IdentityAttestationError):
+        install_io.commit_staged_install(
+            staged=staged,
+            destination=destination,
+            receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+            receipt_path=receipt_path,
+            receipt_writer=forbidden_callback,
+        )
+
+    assert callback_called is False
+    assert prior_child.read_bytes() == b"prior\n"
+    assert external_hardlink.read_bytes() == b"prior\n"
+
+
+def test_uninstall_same_bytes_child_swap_fails_closed_without_deleting_foreign_object(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "CEP" / "dcc-mcp-aftereffects"
+    receipt_path = tmp_path / "state" / "aftereffects.json"
+    destination.mkdir(parents=True)
+    child = destination / "manifest.xml"
+    child.write_bytes(b"installed payload\n")
+    install_io.write_receipt(receipt_path, _receipt_for(destination))
+    displaced = tmp_path / "displaced-owned-child.xml"
+    calls = 0
+
+    def swap_after_recovery_capture() -> None:
+        nonlocal calls
+        calls += 1
+        if calls != 3:
+            return
+        replacement = tmp_path / "same-bytes-foreign-child.xml"
+        replacement.write_bytes(child.read_bytes())
+        os.replace(child, displaced)
+        os.replace(replacement, child)
+
+    with pytest.raises(install_io.IdentityAttestationError):
+        install_io.remove_receipted_install(
+            destination,
+            receipt_path,
+            before_mutation=swap_after_recovery_capture,
+        )
+
+    assert child.exists(), "the unleased replacement must not be deleted"
+    assert displaced.exists(), "the transaction-owned child must remain recoverable"
+    assert receipt_path.exists()
+
+
+def test_rollback_closehandle_failure_does_not_replace_attestation_primary(
+    tmp_path: Path,
+) -> None:
+    checked = tmp_path / "checked.json"
+    checked.write_bytes(b"checked")
+    lease = install_io._ExactObjectLease.acquire(checked)
+    assert install_io._KERNEL32.CloseHandle(lease.native_handle)
+    transaction = install_io.InstallTransaction(
+        destination=tmp_path / "destination",
+        backup=tmp_path / "backup",
+        receipt_path=tmp_path / "receipt.json",
+        old_receipt=None,
+        old_receipt_valid=False,
+        mutation_root_attestor=lambda: False,
+        committed_extension_lease=lease,
+    )
+
+    with pytest.raises(install_io.IdentityAttestationError) as caught:
+        transaction.rollback()
+
+    assert caught.value.stage == "mutation_roots"
+    assert getattr(caught.value, "cleanup_failures", ())
+    assert transaction.committed_extension_lease is lease
+    assert lease.closed is False
+
+
 def test_receipt_lease_fails_closed_while_a_writer_is_open(tmp_path: Path) -> None:
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_bytes(b"checked-receipt")

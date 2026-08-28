@@ -754,10 +754,13 @@ class _ExactObjectLease:
     is_directory: bool
     native_handle: Any | None = None
     file_descriptor: int | None = None
+    # Windows cannot rename a payload root while any child handle remains open. This
+    # token therefore retains the native file ID and is recaptured at every boundary.
+    identity_only: bool = False
     closed: bool = False
 
     @classmethod
-    def acquire(cls, path: Path) -> _ExactObjectLease:
+    def acquire(cls, path: Path, *, share_delete: bool = False) -> _ExactObjectLease:
         path = Path(os.path.abspath(path))
         if os.name != "nt":
             descriptor = os.open(path, os.O_RDONLY)
@@ -775,17 +778,19 @@ class _ExactObjectLease:
 
         invalid = _wintypes.HANDLE(-1).value
         path_is_directory = path.is_dir()
-        desired_access = 0x00010000 | 0x00000080
-        if not path_is_directory:
+        desired_access = 0 if share_delete else 0x00010000 | 0x00000080
+        if not path_is_directory and not share_delete:
             desired_access |= 0x80000000
-        share_mode = 0x1 | (0x2 if path_is_directory else 0)
+        share_mode = (
+            0x1 | (0x2 if path_is_directory or share_delete else 0) | (0x4 if share_delete else 0)
+        )
         handle = _KERNEL32.CreateFileW(
             str(path),
             desired_access,
             share_mode,
             None,
             3,
-            0x02000000 | 0x00200000,
+            0x80 if share_delete else 0x02000000 | 0x00200000,
             None,
         )
         if handle == invalid:
@@ -810,6 +815,30 @@ class _ExactObjectLease:
             )
             _close_native_handle_preserving(error, _KERNEL32, handle)
             raise error
+        if share_delete:
+            if not _KERNEL32.CloseHandle(handle):
+                cleanup_error = ctypes.WinError(ctypes.get_last_error() or 6)
+                error = IdentityAttestationError(
+                    "A payload identity handle could not be released; ownership is indeterminate",
+                    stage="identity_attestation",
+                )
+                _attach_cleanup_failures(error, [cleanup_error])
+                error.open_native_handles = (handle,)
+                error.retained_native_handles = ((_KERNEL32, handle),)
+                raise error from cleanup_error
+            return cls(
+                path=path,
+                physical={
+                    "volume_serial": int(information.volume_serial),
+                    "file_index_high": int(information.file_index_high),
+                    "file_index_low": int(information.file_index_low),
+                    "attributes": int(information.attributes),
+                    "links": int(information.links),
+                    "size": (int(information.size_high) << 32) | int(information.size_low),
+                },
+                is_directory=is_directory,
+                identity_only=True,
+            )
         return cls(
             path=path,
             physical={
@@ -1001,12 +1030,157 @@ class _ExactObjectLease:
     def close(self) -> None:
         if self.closed:
             return
+        if self.identity_only:
+            self.closed = True
+            return
         if os.name == "nt":
             if not _KERNEL32.CloseHandle(self.native_handle):
                 raise ctypes.WinError(ctypes.get_last_error() or 6)
         elif self.file_descriptor is not None:
             os.close(self.file_descriptor)
         self.closed = True
+
+
+def _acquire_payload_file_leases(
+    root: Path,
+    manifest: list[dict[str, Any]],
+) -> tuple[
+    dict[str, tuple[int, int, int, int, int, int, int, int, int, int]],
+    dict[str, _ExactObjectLease],
+]:
+    try:
+        identities = _payload_file_identities(root, manifest)
+    except BaseException as exc:
+        raise IdentityAttestationError(
+            "The extension payload regular-file ownership could not be retained",
+            stage="identity_attestation",
+        ) from exc
+    leases: dict[str, _ExactObjectLease] = {}
+    try:
+        for relative in identities:
+            leases[relative] = _ExactObjectLease.acquire(
+                root / Path(relative),
+                share_delete=True,
+            )
+        if _payload_file_identities(root, manifest) != identities:
+            raise IdentityAttestationError(
+                "The extension payload changed while exact ownership was retained",
+                stage="identity_attestation",
+            )
+    except BaseException as exc:
+        _close_leases_preserving(exc, *leases.values())
+        raise
+    return identities, leases
+
+
+def _retarget_payload_file_leases(
+    leases: Mapping[str, _ExactObjectLease],
+    root: Path,
+) -> None:
+    for relative, lease in leases.items():
+        lease.path = Path(os.path.abspath(root / Path(relative)))
+
+
+def _close_payload_file_leases(
+    leases: dict[str, _ExactObjectLease],
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    failures: list[BaseException] = []
+    retained: list[_ExactObjectLease] = []
+    for relative, lease in tuple(leases.items()):
+        try:
+            lease.close()
+        except BaseException as exc:
+            failures.append(exc)
+            retained.append(lease)
+        else:
+            leases.pop(relative)
+    if not failures:
+        return
+    if primary is not None:
+        _attach_cleanup_failures(primary, failures, retained_leases=tuple(retained))
+        return
+    error = RollbackError("Payload exact-object lease cleanup failed")
+    _attach_cleanup_failures(error, failures, retained_leases=tuple(retained))
+    raise error from failures[0]
+
+
+def _rename_payload_root_with_identity_handoff(
+    root_lease: _ExactObjectLease,
+    destination: Path,
+    manifest: list[dict[str, Any]],
+    identities: Mapping[str, tuple[int, int, int, int, int, int, int, int, int, int]],
+    leases: dict[str, _ExactObjectLease],
+) -> None:
+    _require_payload_file_leases(root_lease.path, manifest, identities, leases)
+    if os.name != "nt":
+        root_lease.rename(destination)
+        _retarget_payload_file_leases(leases, destination)
+        _require_payload_file_leases(destination, manifest, identities, leases)
+        return
+    _close_payload_file_leases(leases)
+    root_lease.rename(destination)
+    current, reacquired = _acquire_payload_file_leases(destination, manifest)
+    leases.update(reacquired)
+    if current != dict(identities):
+        raise IdentityAttestationError(
+            "The extension payload identity changed across the native root rename boundary",
+            stage="identity_attestation",
+        )
+
+
+def _prepare_payload_root_for_deletion(
+    root: Path,
+    manifest: list[dict[str, Any]],
+    identities: Mapping[str, tuple[int, int, int, int, int, int, int, int, int, int]],
+    leases: dict[str, _ExactObjectLease],
+) -> None:
+    _require_payload_file_leases(root, manifest, identities, leases)
+    if os.name == "nt":
+        _close_payload_file_leases(leases)
+
+
+def _require_payload_file_leases(
+    root: Path,
+    manifest: list[dict[str, Any]],
+    identities: Mapping[str, tuple[int, int, int, int, int, int, int, int, int, int]],
+    leases: Mapping[str, _ExactObjectLease],
+) -> None:
+    try:
+        if set(leases) != set(identities) or any(lease.closed for lease in leases.values()):
+            raise OSError("payload lease set is incomplete")
+        for relative, expected in identities.items():
+            lease = leases[relative]
+            if os.name == "nt":
+                physical_matches = (
+                    int(expected[0]) & 0xFFFFFFFF == lease.physical.get("volume_serial")
+                    and int(expected[1])
+                    == (int(lease.physical.get("file_index_high", -1)) << 32)
+                    | int(lease.physical.get("file_index_low", -1))
+                    and int(expected[3]) == lease.physical.get("links")
+                    and int(expected[4]) == lease.physical.get("size")
+                    and int(expected[8]) == lease.physical.get("attributes")
+                )
+            else:
+                physical_matches = (
+                    int(expected[0]) == lease.physical.get("device")
+                    and int(expected[1]) == lease.physical.get("inode")
+                    and int(expected[2]) == lease.physical.get("mode")
+                )
+            if not physical_matches:
+                raise OSError("payload native identity token is inconsistent")
+        current = _payload_file_identities(root, manifest)
+    except BaseException as exc:
+        raise IdentityAttestationError(
+            "The extension payload regular-file ownership changed inside the transaction",
+            stage="identity_attestation",
+        ) from exc
+    if current != dict(identities):
+        raise IdentityAttestationError(
+            "The extension payload regular-file ownership changed inside the transaction",
+            stage="identity_attestation",
+        )
 
 
 def _delete_leased_tree(lease: _ExactObjectLease) -> dict[str, Any]:
@@ -1075,11 +1249,18 @@ class InstallTransaction:
     previous_receipt_lease: _ExactObjectLease | None = None
     committed_extension_lease: _ExactObjectLease | None = None
     committed_receipt_lease: _ExactObjectLease | None = None
+    previous_payload_manifest: list[dict[str, Any]] = field(default_factory=list)
+    previous_payload_identities: Mapping[
+        str,
+        tuple[int, int, int, int, int, int, int, int, int, int],
+    ] = field(default_factory=dict)
+    previous_payload_leases: dict[str, _ExactObjectLease] = field(default_factory=dict)
     payload_manifest: list[dict[str, Any]] = field(default_factory=list)
     payload_identities: Mapping[
         str,
         tuple[int, int, int, int, int, int, int, int, int, int],
     ] = field(default_factory=dict)
+    payload_leases: dict[str, _ExactObjectLease] = field(default_factory=dict)
 
     @staticmethod
     def _require_attestation(
@@ -1128,6 +1309,20 @@ class InstallTransaction:
                 "The published extension payload identity changed inside the transaction",
                 stage="identity_attestation",
             )
+        _require_payload_file_leases(
+            self.destination,
+            self.payload_manifest,
+            self.payload_identities,
+            self.payload_leases,
+        )
+
+    def _require_previous_payload_identity(self) -> None:
+        _require_payload_file_leases(
+            self.backup,
+            self.previous_payload_manifest,
+            self.previous_payload_identities,
+            self.previous_payload_leases,
+        )
 
     def _require_mutation_roots(self) -> None:
         self._require_attestation(
@@ -1162,8 +1357,15 @@ class InstallTransaction:
                 stage="identity_attestation",
             )
 
-    def _release_exact_object_leases(self, *, include_recovery: bool = True) -> None:
+    def _release_exact_object_leases(
+        self,
+        *,
+        include_recovery: bool = True,
+        include_payload: bool = True,
+        primary: BaseException | None = None,
+    ) -> None:
         failures: list[BaseException] = []
+        retained: list[_ExactObjectLease] = []
         attributes = [
             "previous_extension_lease",
             "previous_receipt_lease",
@@ -1180,17 +1382,40 @@ class InstallTransaction:
                 lease.close()
             except BaseException as exc:
                 failures.append(exc)
+                retained.append(lease)
             else:
                 setattr(self, attribute, None)
+        if include_payload:
+            for leases in (self.previous_payload_leases, self.payload_leases):
+                for relative, lease in tuple(leases.items()):
+                    try:
+                        lease.close()
+                    except BaseException as exc:
+                        failures.append(exc)
+                        retained.append(lease)
+                    else:
+                        leases.pop(relative)
         if failures:
+            if primary is not None:
+                _attach_cleanup_failures(
+                    primary,
+                    failures,
+                    retained_leases=tuple(retained),
+                )
+                return
             error = RollbackError("Exact-object lease cleanup failed")
-            error.cleanup_failures = tuple(str(failure)[:512] for failure in failures)
+            _attach_cleanup_failures(
+                error,
+                failures,
+                retained_leases=tuple(retained),
+            )
             raise error from failures[0]
 
     def rollback(self) -> None:
         if self.closed:
             return
         failed = self.destination.with_name(f".{self.destination.name}.failed-{uuid4().hex}")
+        primary: BaseException | None = None
         try:
             with _hold_identity_paths(self.mutation_root_paths):
                 self._require_mutation_roots()
@@ -1198,12 +1423,14 @@ class InstallTransaction:
                     self._require_mutation_roots()
                     if self.committed_extension_lease is None:
                         raise OSError("committed extension object lease is unavailable")
+                    _close_payload_file_leases(self.payload_leases)
                     self.committed_extension_lease.rename(failed)
                     cleanup = _delete_leased_tree(self.committed_extension_lease)
                     if not cleanup.get("success"):
                         raise OSError("committed extension object could not be retired")
                     self.committed_extension_lease = None
                 elif self.committed_extension_lease is not None:
+                    _close_payload_file_leases(self.payload_leases)
                     cleanup = _delete_leased_tree(self.committed_extension_lease)
                     if not cleanup.get("success"):
                         raise OSError("staged extension object could not be retired")
@@ -1215,18 +1442,25 @@ class InstallTransaction:
                 if self.moved_existing:
                     prior_receipt = self._prior_receipt()
                     self._require_mutation_roots()
-                    if prior_receipt is not None and receipt_files_match(
-                        prior_receipt, self.backup
+                    if (
+                        prior_receipt is not None
+                        and set(self.previous_payload_leases)
+                        == set(self.previous_payload_identities)
+                        and receipt_files_match(prior_receipt, self.backup)
                     ):
                         if self.previous_extension_lease is None:
                             raise OSError("previous extension object lease is unavailable")
-                        self.previous_extension_lease.rename(self.destination)
+                        self._require_previous_payload_identity()
+                        _rename_payload_root_with_identity_handoff(
+                            self.previous_extension_lease,
+                            self.destination,
+                            self.previous_payload_manifest,
+                            self.previous_payload_identities,
+                            self.previous_payload_leases,
+                        )
                     elif self.recovery_archive is not None and prior_receipt is not None:
                         if self.previous_extension_lease is not None:
-                            cleanup = _delete_leased_tree(self.previous_extension_lease)
-                            if not cleanup.get("success"):
-                                raise OSError("previous extension backup could not be retired")
-                            self.previous_extension_lease = None
+                            _close_payload_file_leases(self.previous_payload_leases)
                         if self.recovery_archive_lease is None:
                             raise OSError("previous extension recovery lease is unavailable")
                         _restore_recovery_archive(
@@ -1259,6 +1493,9 @@ class InstallTransaction:
                     if restored is None or not receipt_files_match(restored, self.destination):
                         raise OSError("previous After Effects extension rollback did not validate")
                 self.closed = True
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
             if (
                 failed.exists()
@@ -1266,16 +1503,24 @@ class InstallTransaction:
                 and _same_absolute_path(self.committed_extension_lease.path, failed)
             ):
                 self._require_mutation_roots()
+                _close_payload_file_leases(self.payload_leases)
                 cleanup = _delete_leased_tree(self.committed_extension_lease)
                 if cleanup.get("success"):
                     self.committed_extension_lease = None
             if (
                 self.closed
+                and self.recovery_archive is None
                 and self.backup.exists()
                 and self.previous_extension_lease is not None
                 and _same_absolute_path(self.previous_extension_lease.path, self.backup)
             ):
                 self._require_mutation_roots()
+                _prepare_payload_root_for_deletion(
+                    self.previous_extension_lease.path,
+                    self.previous_payload_manifest,
+                    self.previous_payload_identities,
+                    self.previous_payload_leases,
+                )
                 cleanup = _delete_leased_tree(self.previous_extension_lease)
                 if cleanup.get("success"):
                     self.previous_extension_lease = None
@@ -1298,7 +1543,7 @@ class InstallTransaction:
                 self._require_mutation_roots()
                 self.previous_receipt_lease.delete()
                 self.previous_receipt_lease = None
-            self._release_exact_object_leases()
+            self._release_exact_object_leases(primary=primary)
 
     def finalize(self) -> None:
         if self.closed:
@@ -1311,6 +1556,7 @@ class InstallTransaction:
                     raise RestartRequired(
                         "The previous extension backup could not be captured for safe cleanup"
                     )
+                self._require_previous_payload_identity()
                 recovery_archive = self.backup.with_name(
                     f".{self.backup.name}.recovery-{uuid4().hex}.zip"
                 )
@@ -1319,6 +1565,7 @@ class InstallTransaction:
                     self.recovery_archive_lease = _write_recovery_archive(
                         self.backup, prior_receipt, recovery_archive
                     )
+                    self._require_previous_payload_identity()
                 except BaseException as exc:
                     try:
                         if self.recovery_archive_lease is not None:
@@ -1339,6 +1586,13 @@ class InstallTransaction:
                             "The checked extension object lease was lost before cleanup",
                             stage="identity_attestation",
                         )
+                    self._require_previous_payload_identity()
+                    _prepare_payload_root_for_deletion(
+                        self.previous_extension_lease.path,
+                        self.previous_payload_manifest,
+                        self.previous_payload_identities,
+                        self.previous_payload_leases,
+                    )
                     cleanup = _delete_leased_tree(self.previous_extension_lease)
                 except IdentityAttestationError:
                     raise
@@ -1370,7 +1624,10 @@ class InstallTransaction:
                     ) from exc
                 self.previous_receipt_lease = None
             try:
-                self._release_exact_object_leases(include_recovery=False)
+                self._release_exact_object_leases(
+                    include_recovery=False,
+                    include_payload=False,
+                )
             except RollbackError as exc:
                 raise RestartRequired(
                     "The transaction object leases could not be released safely"
@@ -1391,6 +1648,12 @@ class InstallTransaction:
                     raise RestartRequired(
                         "The previous extension recovery snapshot could not be cleaned safely"
                     ) from exc
+            try:
+                _close_payload_file_leases(self.payload_leases)
+            except RollbackError as exc:
+                raise RestartRequired(
+                    "The published payload object leases could not be released safely"
+                ) from exc
             self.receipt_backup = None
             self.recovery_archive = None
             self.closed = True
@@ -1412,6 +1675,8 @@ def commit_staged_install(
     receipt_callback = receipt_path.with_name(f".{receipt_path.name}.callback-{uuid4().hex}.tmp")
     receipt_temporary = receipt_path.with_name(f".{receipt_path.name}.new-{uuid4().hex}.tmp")
     callback_receipt_lease: _ExactObjectLease | None = None
+    staged_payload_leases: dict[str, _ExactObjectLease] = {}
+    previous_payload_leases: dict[str, _ExactObjectLease] = {}
     previous_extension_lease = (
         _ExactObjectLease.acquire(destination)
         if destination.exists() or destination.is_symlink()
@@ -1445,7 +1710,10 @@ def commit_staged_install(
             raise error
     try:
         staged_manifest = file_manifest(staged)
-        staged_payload_identities = _payload_file_identities(staged, staged_manifest)
+        staged_payload_identities, staged_payload_leases = _acquire_payload_file_leases(
+            staged,
+            staged_manifest,
+        )
         inspection = inspect_install_root(destination)
         if inspection.get("requires_restart"):
             raise RestartRequired(
@@ -1461,6 +1729,28 @@ def commit_staged_install(
         else:
             old_receipt = None
         old_payload = _receipt_from_bytes(old_receipt) if old_receipt is not None else None
+        previous_payload_manifest: list[dict[str, Any]] = []
+        previous_payload_identities: dict[
+            str,
+            tuple[int, int, int, int, int, int, int, int, int, int],
+        ] = {}
+        if previous_extension_lease is not None:
+            if old_payload is None or not receipt_files_match(old_payload, destination):
+                raise IdentityAttestationError(
+                    "The existing extension lacks an exact canonical ownership receipt",
+                    stage="identity_attestation",
+                )
+            entries = old_payload.get("files")
+            if not isinstance(entries, list):
+                raise IdentityAttestationError(
+                    "The existing extension ownership receipt is incomplete",
+                    stage="identity_attestation",
+                )
+            previous_payload_manifest = deepcopy(entries)
+            (
+                previous_payload_identities,
+                previous_payload_leases,
+            ) = _acquire_payload_file_leases(destination, previous_payload_manifest)
     except BaseException as exc:
         try:
             remove_staging(committed_extension_lease)
@@ -1474,6 +1764,8 @@ def commit_staged_install(
             exc,
             previous_extension_lease,
             previous_receipt_lease,
+            *previous_payload_leases.values(),
+            *staged_payload_leases.values(),
         )
         raise
     transaction = InstallTransaction(
@@ -1494,8 +1786,12 @@ def commit_staged_install(
         previous_extension_lease=previous_extension_lease,
         previous_receipt_lease=previous_receipt_lease,
         committed_extension_lease=committed_extension_lease,
+        previous_payload_manifest=previous_payload_manifest,
+        previous_payload_identities=previous_payload_identities,
+        previous_payload_leases=previous_payload_leases,
         payload_manifest=deepcopy(staged_manifest),
         payload_identities=staged_payload_identities,
+        payload_leases=staged_payload_leases,
     )
 
     def require_identity() -> None:
@@ -1528,7 +1824,15 @@ def commit_staged_install(
                     "The checked extension object lease was unavailable before backup",
                     stage="identity_attestation",
                 )
-            rename_checked_object(transaction.previous_extension_lease, backup)
+            with _hold_identity_paths(identity_paths):
+                require_identity()
+                _rename_payload_root_with_identity_handoff(
+                    transaction.previous_extension_lease,
+                    backup,
+                    transaction.previous_payload_manifest,
+                    transaction.previous_payload_identities,
+                    transaction.previous_payload_leases,
+                )
             transaction.moved_existing = True
         if transaction.receipt_backup is not None:
             if transaction.previous_receipt_lease is None:
@@ -1541,7 +1845,13 @@ def commit_staged_install(
             transaction.moved_receipt = True
         with _hold_identity_paths(identity_paths):
             require_identity()
-            transaction.committed_extension_lease.rename(destination)
+            _rename_payload_root_with_identity_handoff(
+                transaction.committed_extension_lease,
+                destination,
+                transaction.payload_manifest,
+                transaction.payload_identities,
+                transaction.payload_leases,
+            )
         transaction.committed_new = True
         transaction._require_payload_identity()
         receipt["receipt_version"] = 1
@@ -1823,6 +2133,12 @@ def _remove_receipted_install(
     receipt_bytes = b""
     moved = False
     recovery_lease: _ExactObjectLease | None = None
+    payload_manifest: list[dict[str, Any]] = []
+    payload_identities: dict[
+        str,
+        tuple[int, int, int, int, int, int, int, int, int, int],
+    ] = {}
+    payload_leases: dict[str, _ExactObjectLease] = {}
 
     def cleanup(path: Path) -> bool:
         if not path.exists() and not path.is_symlink():
@@ -1834,10 +2150,26 @@ def _remove_receipted_install(
         nonlocal extension_lease, receipt_lease
         try:
             if extension_lease is not None:
-                cleanup_result = _delete_leased_tree(extension_lease)
-                if not cleanup_result.get("success"):
-                    raise OSError("After Effects failed destination could not be quarantined")
-                extension_lease = None
+                try:
+                    _require_payload_file_leases(
+                        extension_lease.path,
+                        payload_manifest,
+                        payload_identities,
+                        payload_leases,
+                    )
+                except IdentityAttestationError:
+                    pass
+                else:
+                    _prepare_payload_root_for_deletion(
+                        extension_lease.path,
+                        payload_manifest,
+                        payload_identities,
+                        payload_leases,
+                    )
+                    cleanup_result = _delete_leased_tree(extension_lease)
+                    if not cleanup_result.get("success"):
+                        raise OSError("After Effects failed destination could not be quarantined")
+                    extension_lease = None
             elif not cleanup(destination):
                 raise OSError("After Effects failed destination could not be quarantined")
             if receipt is None:
@@ -1888,16 +2220,57 @@ def _remove_receipted_install(
             raise InstallIoError(
                 "A complete matching After Effects receipt is required for uninstall"
             )
+        entries = receipt.get("files")
+        if not isinstance(entries, list):
+            raise IdentityAttestationError(
+                "The uninstall receipt lacks a canonical payload closure",
+                stage="identity_attestation",
+            )
+        payload_manifest = deepcopy(entries)
+        payload_identities, payload_leases = _acquire_payload_file_leases(
+            destination,
+            payload_manifest,
+        )
         inspection = inspect_install_root(destination)
         if inspection.get("requires_restart"):
             raise RestartRequired("After Effects holds the receipted extension open")
         if before_mutation is not None:
             before_mutation()
+        _require_payload_file_leases(
+            destination,
+            payload_manifest,
+            payload_identities,
+            payload_leases,
+        )
         recovery_lease = _write_recovery_archive(destination, receipt, recovery)
+        _require_payload_file_leases(
+            destination,
+            payload_manifest,
+            payload_identities,
+            payload_leases,
+        )
         if before_mutation is not None:
             before_mutation()
-        extension_lease.rename(quarantine)
+        _require_payload_file_leases(
+            destination,
+            payload_manifest,
+            payload_identities,
+            payload_leases,
+        )
+        _rename_payload_root_with_identity_handoff(
+            extension_lease,
+            quarantine,
+            payload_manifest,
+            payload_identities,
+            payload_leases,
+        )
         moved = True
+        _prepare_payload_root_for_deletion(
+            quarantine,
+            payload_manifest,
+            payload_identities,
+            payload_leases,
+        )
         cleanup_result = _delete_leased_tree(extension_lease)
         if not cleanup_result.get("success"):
             raise PermissionError("After Effects extension cleanup is locked")
@@ -1955,6 +2328,14 @@ def _remove_receipted_install(
             except BaseException as cleanup_error:
                 failures.append(cleanup_error)
                 retained.append(receipt_lease)
+        for relative, lease in tuple(payload_leases.items()):
+            try:
+                lease.close()
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
+                retained.append(lease)
+            else:
+                payload_leases.pop(relative)
         if failures:
             if primary is not None:
                 _attach_cleanup_failures(
