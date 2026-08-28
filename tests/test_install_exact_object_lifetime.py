@@ -53,6 +53,21 @@ def _prior_transaction_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     return staged, destination, receipt_path
 
 
+def _physical_identity(path: Path) -> tuple[int, int]:
+    details = path.lstat()
+    return int(details.st_dev), int(details.st_ino)
+
+
+def _physical_object_survives(root: Path, identity: tuple[int, int]) -> bool:
+    for path in root.rglob("*"):
+        try:
+            if path.is_file() and _physical_identity(path) == identity:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _round_trip_same_inode(path: Path) -> tuple[os.stat_result, os.stat_result]:
     original = path.read_bytes()
     before = path.stat()
@@ -212,7 +227,7 @@ def test_finalize_holds_recovery_archive_lease_until_deletion(
     attempted = False
     blocked = False
 
-    def attempt_archive_swap(lease: object) -> dict[str, object]:
+    def attempt_archive_swap(lease: object, **kwargs: object) -> dict[str, object]:
         nonlocal attempted, blocked
         archive = transaction.recovery_archive
         assert archive is not None and archive.exists()
@@ -222,7 +237,7 @@ def test_finalize_holds_recovery_archive_lease_until_deletion(
         except OSError as exc:
             assert install_io._locked_error(exc)
             blocked = True
-        return original_delete(lease)
+        return original_delete(lease, **kwargs)
 
     monkeypatch.setattr(install_io, "_delete_leased_tree", attempt_archive_swap)
     transaction.finalize()
@@ -855,6 +870,137 @@ def test_finalize_rejects_a_post_commit_same_bytes_payload_child_swap(tmp_path: 
     transaction.rollback()
 
     assert (destination / "manifest.xml").read_bytes() == b"prior\n"
+
+
+def test_callback_rollback_preserves_same_bytes_foreign_payload_child(
+    tmp_path: Path,
+) -> None:
+    staged, destination, receipt_path = _prior_transaction_paths(tmp_path)
+    displaced_owned = tmp_path / "displaced-callback-owned.xml"
+    foreign_identity: tuple[int, int] | None = None
+
+    def replace_child(path: Path, receipt: object) -> None:
+        nonlocal foreign_identity
+        child = destination / "manifest.xml"
+        contents = child.read_bytes()
+        os.replace(child, displaced_owned)
+        foreign = tmp_path / "foreign-callback-child.xml"
+        foreign.write_bytes(contents)
+        foreign_identity = _physical_identity(foreign)
+        os.replace(foreign, child)
+        install_io.write_receipt(path, receipt)
+
+    with pytest.raises(install_io.IdentityAttestationError) as caught:
+        install_io.commit_staged_install(
+            staged=staged,
+            destination=destination,
+            receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+            receipt_path=receipt_path,
+            receipt_writer=replace_child,
+        )
+
+    assert foreign_identity is not None
+    assert caught.value.stage == "identity_attestation"
+    assert caught.value.rollback_failed is False
+    assert getattr(caught.value, "retained_cleanup_paths", ())
+    assert _physical_object_survives(tmp_path, foreign_identity)
+    assert displaced_owned.exists()
+    assert (destination / "manifest.xml").read_bytes() == b"prior\n"
+
+
+def test_finalize_rollback_preserves_same_bytes_foreign_payload_child(
+    tmp_path: Path,
+) -> None:
+    staged, destination, receipt_path = _prior_transaction_paths(tmp_path)
+    transaction = install_io.commit_staged_install(
+        staged=staged,
+        destination=destination,
+        receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+        receipt_path=receipt_path,
+    )
+    child = destination / "manifest.xml"
+    displaced_owned = tmp_path / "displaced-finalize-owned.xml"
+    contents = child.read_bytes()
+    os.replace(child, displaced_owned)
+    foreign = tmp_path / "foreign-finalize-child.xml"
+    foreign.write_bytes(contents)
+    foreign_identity = _physical_identity(foreign)
+    os.replace(foreign, child)
+
+    with pytest.raises(install_io.IdentityAttestationError):
+        transaction.finalize()
+    transaction.rollback()
+
+    assert transaction.retained_cleanup_paths
+    assert _physical_object_survives(tmp_path, foreign_identity)
+    assert displaced_owned.exists()
+    assert (destination / "manifest.xml").read_bytes() == b"prior\n"
+
+
+def test_uninstall_predelete_swap_preserves_foreign_child_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "CEP" / "dcc-mcp-aftereffects"
+    receipt_path = tmp_path / "state" / "aftereffects.json"
+    destination.mkdir(parents=True)
+    (destination / "manifest.xml").write_bytes(b"installed payload\n")
+    install_io.write_receipt(receipt_path, _receipt_for(destination))
+    original_prepare = install_io._prepare_payload_root_for_deletion
+    displaced_owned = tmp_path / "displaced-uninstall-owned.xml"
+    foreign_identity: tuple[int, int] | None = None
+
+    def prepare_then_swap(
+        root: Path,
+        manifest: list[dict[str, object]],
+        identities: object,
+        leases: dict[str, object],
+    ) -> None:
+        nonlocal foreign_identity
+        original_prepare(root, manifest, identities, leases)
+        child = root / "manifest.xml"
+        contents = child.read_bytes()
+        os.replace(child, displaced_owned)
+        foreign = tmp_path / "foreign-uninstall-child.xml"
+        foreign.write_bytes(contents)
+        foreign_identity = _physical_identity(foreign)
+        os.replace(foreign, child)
+
+    monkeypatch.setattr(install_io, "_prepare_payload_root_for_deletion", prepare_then_swap)
+
+    with pytest.raises(install_io.IdentityAttestationError) as caught:
+        install_io.remove_receipted_install(destination, receipt_path)
+
+    assert foreign_identity is not None
+    assert caught.value.stage == "identity_attestation"
+    assert caught.value.rollback_failed is False
+    assert getattr(caught.value, "retained_cleanup_paths", ())
+    assert _physical_object_survives(tmp_path, foreign_identity)
+    assert displaced_owned.exists()
+    assert receipt_path.exists()
+    restored = install_io.read_receipt(receipt_path)
+    assert restored is not None
+    assert install_io.receipt_files_match(restored, destination)
+
+
+def test_clean_payload_child_lease_flow_still_finalizes_and_uninstalls(
+    tmp_path: Path,
+) -> None:
+    staged, destination, receipt_path = _prior_transaction_paths(tmp_path)
+    transaction = install_io.commit_staged_install(
+        staged=staged,
+        destination=destination,
+        receipt={"dcc_type": "aftereffects", "extension_path": str(destination)},
+        receipt_path=receipt_path,
+    )
+
+    transaction.finalize()
+    assert transaction.retained_cleanup_paths == ()
+    assert install_io.receipt_files_match(install_io.read_receipt(receipt_path), destination)
+
+    install_io.remove_receipted_install(destination, receipt_path)
+    assert not destination.exists()
+    assert not receipt_path.exists()
 
 
 def test_finalize_rejects_same_inode_round_trip_payload_drift(tmp_path: Path) -> None:
