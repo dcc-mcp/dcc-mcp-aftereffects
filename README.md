@@ -62,6 +62,24 @@ dcc-mcp-aftereffects install --json --yes --dcc-path "<host>" --python "<python>
 dcc-mcp-aftereffects verify --json --dcc-path "<host>" --python "<python>"
 ```
 
+For an Internal deployment with an approved prebuilt CEP bridge, the shared
+CLI can link the bridge directly into the Adobe CEP extension root:
+
+```powershell
+dcc-mcp-cli install --dcc-type aftereffects `
+  --plugin-source F:\studio\artifacts\aftereffects-cep-bridge `
+  --adobe-debug-root "$env:APPDATA\Adobe\CEP\extensions" `
+  --execute
+```
+
+The source directory must contain the bridge manifest and is selected by an
+approved catalog or Internal descriptor. This path does not copy files or
+require a Developer Tool, but it is only valid for a bridge that has already
+been built and approved. The adapter-owned installer remains canonical for
+adobepy provisioning, generated CEP bridges, receipts, upgrades, and
+uninstall. Restart After Effects if it has already cached the extension, then
+use `dcc-mcp-cli wait-ready --dcc-type aftereffects` to verify the live bridge.
+
 See [install.md](install.md) for supported Windows/macOS paths, the Linux
 boundary, adobepy CLI provisioning, receipt-driven upgrade/uninstall, stable
 exit codes, and troubleshooting. Each adapter instance uses an OS-assigned
