@@ -42,6 +42,29 @@ Keep the token in the process environment. The adapter passes it to the
 supported CLI through `ADOBEPY_TOKEN`; it never places the token in command
 arguments, reports, logs, receipts, or PR text.
 
+## Internal prebuilt bridge link
+
+An Internal workstation image may provide an already-built and approved CEP
+bridge. In that case the shared Core CLI can create an idempotent directory
+link without copying the bridge or using a Developer Tool:
+
+```powershell
+dcc-mcp-cli install --dcc-type aftereffects `
+  --plugin-source <cep-bridge-root> `
+  --adobe-debug-root "$env:APPDATA\Adobe\CEP\extensions" `
+  --execute
+```
+
+The source must be the bridge root and contain its manifest. An approved
+catalog or Internal descriptor supplies the product, extension type, plugin ID,
+and source mapping; the public adapter package does not claim to contain a
+static `aftereffects_cep` source tree. Use `DCC_MCP_PLUGIN_SOURCE` and
+`DCC_MCP_ADOBE_DEBUG_ROOT` for stable workstation profiles. A filesystem link
+does not prove that After Effects loaded the extension, so run the adapter
+verification and `dcc-mcp-cli wait-ready --dcc-type aftereffects` afterward.
+The adapter-owned lifecycle below remains the production path for generated
+bridges, trust checks, receipts, upgrades, and uninstall.
+
 ## Supported versions
 
 Current adapter release: **0.7.0** <!-- x-release-please-version -->

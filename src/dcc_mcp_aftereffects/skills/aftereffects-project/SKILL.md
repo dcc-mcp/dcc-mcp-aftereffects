@@ -18,3 +18,23 @@ metadata:
 ---
 
 # After Effects Project
+
+## Installation and readiness
+
+Use the adapter-owned install runbook for packaged installs, adobepy
+provisioning, generated CEP bridges, upgrades, receipts, and uninstall. For an
+Internal deployment with an approved prebuilt CEP bridge:
+
+1. Run `dcc-mcp-cli doctor` to inspect the local CLI and gateway.
+2. Run `dcc-mcp-cli install --dcc-type aftereffects` with the approved bridge
+   root in `--plugin-source` and the Adobe CEP extension root in
+   `--adobe-debug-root`. Internal profiles may provide
+   `DCC_MCP_PLUGIN_SOURCE` and `DCC_MCP_ADOBE_DEBUG_ROOT`.
+3. Restart After Effects if it has cached the extension.
+4. Run `dcc-mcp-cli list` and
+   `dcc-mcp-cli wait-ready --dcc-type aftereffects` before loading this skill.
+
+The bridge root must contain its manifest and be selected by an approved
+catalog or Internal descriptor. This skill does not create links, copy bridge
+files, or treat a filesystem link as proof of a loaded CEP session. Confirm
+readiness through the CLI and adapter status.
