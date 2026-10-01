@@ -25,9 +25,9 @@ from packaging.version import InvalidVersion, Version
 from .install_contract import (
     EXIT_ACQUIRE,
     EXIT_PREFLIGHT,
-    INSTALL_SOP_SCHEMA_ID,
-    INSTALL_SOP_SCHEMA_SHA256,
-    INSTALL_SOP_SCHEMA_SIZE,
+    INSTALL_SOP_ARTIFACT_PINS,
+    SCHEMA_VERSION,
+    report_schema_version,
 )
 from .install_models import InstallRequest, ResolvedInstall
 
@@ -1652,15 +1652,32 @@ def resolve_install(
                 "python", "Target Python imports are not owned by their selected distributions"
             )
         _version_key(module.get("version"))
+    pins = (
+        INSTALL_SOP_ARTIFACT_PINS.get(core_schema.get("id"))
+        if isinstance(core_schema, dict)
+        else None
+    )
     if (
-        not isinstance(core_schema, dict)
-        or core_schema.get("id") != INSTALL_SOP_SCHEMA_ID
-        or core_schema.get("size") != INSTALL_SOP_SCHEMA_SIZE
-        or core_schema.get("sha256") != INSTALL_SOP_SCHEMA_SHA256
+        pins is None
+        or (core_schema.get("size"), core_schema.get("sha256")) not in pins
         or core_schema.get("record_owned") is not True
     ):
         raise PreflightError(
             "core", "Target Core does not contain the canonical Install SOP schema"
+        )
+    try:
+        published_schema_version = report_schema_version()
+    except Exception as exc:
+        # Core funnels every schema-load failure into RuntimeError. Letting it
+        # escape would reach the generic lifecycle fallback and return
+        # EXIT_INSTALL (30) with failure_stage=internal_error; a core that
+        # cannot prove its own schema is an unmet prerequisite, so keep the
+        # documented EXIT_PREFLIGHT (10) contract and a locatable reason.
+        raise PreflightError("core", "Target Core's Install SOP schema could not be read") from exc
+    if published_schema_version != SCHEMA_VERSION:
+        raise PreflightError(
+            "core",
+            "Target Core's Install SOP schema pins a different report schema_version",
         )
     modules = capture_python_modules(modules)
     metadata["core"] = modules["core"]["version"]

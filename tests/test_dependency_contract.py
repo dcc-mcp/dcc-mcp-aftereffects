@@ -17,5 +17,7 @@ def test_ci_exercises_floor_and_latest_compatible_dependencies():
         'python -m pip install --upgrade --upgrade-strategy eager -e ".[dev]"'
     )
     assert steps["Validate dependency lane"]["run"] == (
-        "python -m pip check\npytest tests/test_package.py tests/test_install_hardening.py -q\n"
+        "python -m pip check\n"
+        "pytest tests/test_package.py tests/test_install_hardening.py "
+        "tests/test_install_contract.py -q\n"
     )
