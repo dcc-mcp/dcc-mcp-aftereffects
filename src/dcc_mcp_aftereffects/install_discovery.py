@@ -1665,7 +1665,16 @@ def resolve_install(
         raise PreflightError(
             "core", "Target Core does not contain the canonical Install SOP schema"
         )
-    if report_schema_version() != SCHEMA_VERSION:
+    try:
+        published_schema_version = report_schema_version()
+    except Exception as exc:
+        # Core funnels every schema-load failure into RuntimeError. Letting it
+        # escape would reach the generic lifecycle fallback and return
+        # EXIT_INSTALL (30) with failure_stage=internal_error; a core that
+        # cannot prove its own schema is an unmet prerequisite, so keep the
+        # documented EXIT_PREFLIGHT (10) contract and a locatable reason.
+        raise PreflightError("core", "Target Core's Install SOP schema could not be read") from exc
+    if published_schema_version != SCHEMA_VERSION:
         raise PreflightError(
             "core",
             "Target Core's Install SOP schema pins a different report schema_version",

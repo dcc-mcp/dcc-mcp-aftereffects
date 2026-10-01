@@ -30,7 +30,7 @@ INSTALL_SOP_SCHEMA_ID = "https://dcc-mcp.github.io/schemas/adapter-install-sop-v
 INSTALL_SOP_SCHEMA_SIZE = 4_261
 INSTALL_SOP_SCHEMA_SHA256 = "3ca25788439917b4d4c0617230a762f9797756b5b54f45c8c4149f975b90f904"
 
-# dcc-mcp-core 0.20.35 re-published the *v1* artifact in place, keeping its
+# dcc-mcp-core 0.20.30 re-published the *v1* artifact in place, keeping its
 # `$id` while growing it from 4261 to 4899 bytes. The second revision is named
 # alongside the first so the original bytes stay pinned instead of being
 # silently overwritten by a supposedly immutable published artifact.
@@ -66,19 +66,33 @@ def runtime_core_version() -> str:
 def report_schema_version() -> int:
     """The ``schema_version`` const the resolved core's Install SOP pins.
 
-    Reports must carry :data:`SCHEMA_VERSION`. This reads the value back out of
-    the artifact so a core that moves the ``const`` is detected at preflight
-    time instead of shipping reports that violate their own declared schema.
-    A core that cannot produce the document yields ``SCHEMA_VERSION``, so the
-    report path stays usable; tests/test_install_contract.py is the guard that
-    is guaranteed to run in CI.
+    Reports must carry :data:`SCHEMA_VERSION`. Reading the const back out of
+    the artifact means a core that moves it is detected at preflight time
+    instead of shipping reports that violate their own declared schema.
+
+    Raises:
+        RuntimeError: If the resolved core cannot produce its Install SOP
+            document. Core funnels every load failure -- missing file, bad
+            UTF-8, duplicate key, invalid JSON, external ``$ref``, digest or
+            dialect mismatch -- into ``RuntimeError``.
+        ValueError: If the document does not pin an integer ``const``.
+
+    Callers must convert those into a preflight failure. Letting them reach the
+    generic lifecycle fallback would report ``EXIT_INSTALL`` (30) with
+    ``failure_stage=internal_error``, losing the ``EXIT_PREFLIGHT`` (10)
+    contract that tells an operator the prerequisites are unmet.
     """
     try:
         schema = _install_sop.load_install_sop_schema()
-        const = schema.get("properties", {}).get("schema_version", {}).get("const")
-    except (AttributeError, OSError, TypeError, ValueError):
+    except AttributeError:
+        # Core predates the loader. The byte-exact artifact pin in
+        # INSTALL_SOP_ARTIFACT_PINS already guarantees the document, so the
+        # pinned value remains the correct one to emit.
         return SCHEMA_VERSION
-    return const if isinstance(const, int) and not isinstance(const, bool) else SCHEMA_VERSION
+    const = schema.get("properties", {}).get("schema_version", {}).get("const")
+    if not isinstance(const, int) or isinstance(const, bool):
+        raise ValueError(f"Install SOP schema does not pin an integer schema_version: {const!r}")
+    return const
 
 
 __all__ = [

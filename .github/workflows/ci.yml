@@ -30,7 +30,7 @@ jobs:
       - name: Validate dependency lane
         run: |
           python -m pip check
-          pytest tests/test_package.py tests/test_install_hardening.py -q
+          pytest tests/test_package.py tests/test_install_hardening.py tests/test_install_contract.py -q
 
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}

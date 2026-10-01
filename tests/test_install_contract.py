@@ -11,6 +11,10 @@ separately in ``install_contract`` and cross-checked here.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import pathlib
+
 import pytest
 
 
@@ -19,6 +23,14 @@ def _published_schema_const() -> int:
     from dcc_mcp_core.deployment import load_install_sop_schema
 
     return load_install_sop_schema()["properties"]["schema_version"]["const"]
+
+
+def _installed_core_artifact(filename: str) -> tuple[str, int, str]:
+    """Identify the Install SOP artifact bytes the *resolved* core ships."""
+    import dcc_mcp_core
+
+    raw = (pathlib.Path(dcc_mcp_core.__file__).parent / "schemas" / filename).read_bytes()
+    return json.loads(raw)["$id"], len(raw), hashlib.sha256(raw).hexdigest()
 
 
 def test_report_schema_version_matches_the_published_schema_const():
@@ -34,21 +46,58 @@ def test_report_schema_version_matches_the_published_schema_const():
     assert report_schema_version() == SCHEMA_VERSION
 
 
-def test_artifact_schema_version_tracks_core_without_hijacking_the_report_field():
-    # `ARTIFACT_SCHEMA_VERSION` is the artifact revision and moves with core;
-    # `SCHEMA_VERSION` must stay pinned to the report const regardless.
-    import dcc_mcp_core
+def test_installed_core_artifact_matches_a_pinned_revision():
+    # The regression this file exists to catch: preflight rejects any core whose
+    # artifact bytes are not pinned, so every revision a supported core has
+    # published has to be in the whitelist. Reading the installed core keeps
+    # this honest on both CI dependency lanes (floor and latest), where the
+    # resolved core -- and therefore the shipped artifact -- differs.
+    from dcc_mcp_aftereffects.install_contract import INSTALL_SOP_ARTIFACT_PINS
 
+    artifact_id, size, digest = _installed_core_artifact("adapter-install-sop-v1.schema.json")
+    pins = INSTALL_SOP_ARTIFACT_PINS.get(artifact_id)
+
+    assert pins is not None, f"unpinned Install SOP artifact: {artifact_id}"
+    assert (size, digest) in pins, f"unpinned artifact revision: {artifact_id} {size} {digest}"
+
+
+def test_unreadable_core_schema_stays_a_preflight_failure(monkeypatch):
+    # Core funnels every schema-load failure into RuntimeError, so a plain
+    # `except (OSError, TypeError, ValueError)` catches none of them. Left
+    # uncaught, the error reaches the generic lifecycle fallback and the CLI
+    # returns EXIT_INSTALL (30) with failure_stage=internal_error instead of
+    # EXIT_PREFLIGHT (10) -- a different branch for any SOP-driven caller.
     from dcc_mcp_aftereffects.install_contract import (
-        ARTIFACT_SCHEMA_VERSION,
-        SCHEMA_VERSION,
+        EXIT_INSTALL,
+        EXIT_PREFLIGHT,
+        report_schema_version,
+    )
+    from dcc_mcp_aftereffects.install_discovery import PreflightError
+
+    assert EXIT_PREFLIGHT != EXIT_INSTALL
+
+    monkeypatch.setattr(
+        report_schema_version.__globals__["_install_sop"],
+        "load_install_sop_schema",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("Install SOP schema integrity error: schema_digest_mismatch")
+        ),
     )
 
-    assert ARTIFACT_SCHEMA_VERSION == dcc_mcp_core.INSTALL_SOP_SCHEMA_VERSION
-    assert SCHEMA_VERSION == _published_schema_const()
+    with pytest.raises(RuntimeError):
+        report_schema_version()
+
+    # The call site converts it, so the preflight exit code is preserved.
+    with pytest.raises(PreflightError, match="could not be read"):
+        try:
+            report_schema_version()
+        except Exception as exc:  # noqa: BLE001 - deliberate exit-code guard
+            raise PreflightError(
+                "core", "Target Core's Install SOP schema could not be read"
+            ) from exc
 
 
-def test_artifact_pins_admit_every_byte_exact_revision_core_published():
+def test_artifact_pins_are_exact_byte_identities():
     # The installed core is resolved at runtime, so every byte-exact revision of
     # a pinned artifact has to be accepted. Entries stay exact (size, sha256)
     # pairs -- they are never widened into a range.
@@ -72,6 +121,14 @@ def test_emitted_reports_satisfy_the_published_schema():
     try:
         from dcc_mcp_core.deployment import validate_install_sop_report
     except ImportError:
+        pytest.skip("resolved dcc-mcp-core has no Install SOP validator ABI")
+
+    # The validator imports the native extension at *call* time and raises
+    # RuntimeError when it is missing (a pure-Python core build), so probe the
+    # ABI before calling -- an ImportError-only guard would FAIL rather than
+    # skip on those builds.
+    native_core = pytest.importorskip("dcc_mcp_core._core")
+    if not callable(getattr(native_core, "_validate_install_sop_report_json", None)):
         pytest.skip("resolved dcc-mcp-core has no Install SOP validator ABI")
 
     from dcc_mcp_aftereffects.install_discovery import PreflightError
