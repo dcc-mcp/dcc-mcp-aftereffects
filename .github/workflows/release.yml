@@ -16,12 +16,65 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      tag_sha: ${{ steps.target.outputs.tag_sha }}
     steps:
       - id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Resolve immutable release target
+        id: target
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Anchor every release check on the commit the release TAG resolves to,
+          # never on github.sha. The release PR can be merged while this run is
+          # still starting up; release-please then tags that later merge commit,
+          # so the tag legitimately points somewhere other than the commit that
+          # started this run. Asserting against github.sha made the release fail
+          # in exactly that case, and the next push skipped every publish job
+          # (release_created is false once the release exists), so the release
+          # shipped with no artifacts and could never self-heal.
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release target must be a canonical vMAJOR.MINOR.PATCH tag." >&2
+            exit 1
+          fi
+          object_type=""
+          object_sha=""
+          # The tag can take a moment to become readable after release-please
+          # creates it, so retry for up to a minute before giving up.
+          for _ in $(seq 1 12); do
+            if object_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.type 2>/dev/null)"; then
+              object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha)"
+              [ -n "$object_sha" ] && break
+            fi
+            echo "waiting for $RELEASE_TAG to become visible on origin"
+            sleep 5
+          done
+          # Peel annotated tags until a commit object is reached.
+          for _ in 1 2 3 4 5 6 7 8; do
+            if [[ "$object_type" == "commit" ]]; then
+              break
+            fi
+            if [[ "$object_type" != "tag" ]]; then
+              echo "Release tag does not resolve to a commit." >&2
+              exit 1
+            fi
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(jq -r .object.type <<<"$tag_json")"
+            object_sha="$(jq -r .object.sha <<<"$tag_json")"
+          done
+          if [[ "$object_type" != "commit" || ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release tag commit identity is invalid." >&2
+            exit 1
+          fi
+          echo "tag $RELEASE_TAG -> $object_sha"
+          echo "tag_sha=$object_sha" >> "$GITHUB_OUTPUT"
 
   build-release-artifacts:
     needs: release-please
@@ -30,7 +83,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Check out the release tag itself. Without an explicit ref this built
+      # from the default-branch HEAD, so the artifacts were not provably built
+      # from the commit the tag points at.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: {python-version: "3.12"}
       - name: Build release distributions
@@ -76,7 +134,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ needs.release-please.outputs.tag_sha }}
         run: |
           set -euo pipefail
           test -n "${RELEASE_TAG:-}"

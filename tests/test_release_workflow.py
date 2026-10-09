@@ -97,7 +97,21 @@ def _assert_actions_and_permissions_contract(contents: str) -> None:
     assert jobs["release-please"]["outputs"] == {
         "release_created": "${{ steps.release.outputs.release_created }}",
         "tag_name": "${{ steps.release.outputs.tag_name }}",
+        "tag_sha": "${{ steps.target.outputs.tag_sha }}",
     }
+    # The tag has to be resolved to a commit before anything is built, otherwise
+    # the release identity checks compare against github.sha, which is the commit
+    # that started the run rather than the one the release tag points at.
+    resolve_step = _unique_named_step(jobs["release-please"], "Resolve immutable release target")
+    assert resolve_step["id"] == "target"
+    assert resolve_step["if"] == "steps.release.outputs.release_created == 'true'"
+    assert resolve_step["env"] == {
+        "GH_TOKEN": "${{ github.token }}",
+        "RELEASE_TAG": "${{ steps.release.outputs.tag_name }}",
+    }
+    resolve_lines = _normalized_shell_lines(resolve_step["run"])
+    assert 'echo "tag_sha=$object_sha" >> "$GITHUB_OUTPUT"' in resolve_lines
+    assert any("git/ref/tags" in line for line in resolve_lines)
     assert jobs["build-release-artifacts"]["needs"] == "release-please"
     assert jobs["publish"]["needs"] == ["release-please", "build-release-artifacts"]
     assert jobs["attach-release-artifacts"]["needs"] == [
@@ -134,6 +148,13 @@ def _assert_artifact_handoff_contract(contents: str) -> None:
     publish = jobs["publish"]
     attach = jobs["attach-release-artifacts"]
 
+    # The build must check out the release tag. With no explicit ref it builds the
+    # default-branch HEAD, so the artifacts are not provably from the tagged commit.
+    build_checkout = build["steps"][0]
+    assert build_checkout["uses"] == CHECKOUT_ACTION
+    assert build_checkout["with"] == {
+        "ref": "${{ needs.release-please.outputs.tag_name }}",
+    }
     build_step = _unique_named_step(build, "Build release distributions")
     upload = _unique_named_step(build, "Upload release distributions")
     publish_download = _unique_named_step(publish, "Download release distributions")
@@ -169,7 +190,7 @@ def _assert_artifact_handoff_contract(contents: str) -> None:
         "GH_TOKEN": "${{ github.token }}",
         "GH_REPO": "${{ github.repository }}",
         "RELEASE_TAG": "${{ needs.release-please.outputs.tag_name }}",
-        "EXPECTED_SHA": "${{ github.sha }}",
+        "EXPECTED_SHA": "${{ needs.release-please.outputs.tag_sha }}",
     }
     assert _normalized_shell_lines(attach_step["run"]) == (
         "set -euo pipefail",
