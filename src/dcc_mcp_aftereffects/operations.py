@@ -110,6 +110,40 @@ def _layer(composition: Any, key: Any) -> Any:
     return layer if layer is not None else _find_by_key(composition.layers, key, "layer")
 
 
+def _resolve_composition(app: Any, key: Any) -> tuple[Any, str]:
+    """Resolve a composition explicitly, or fall back to active, selected, first."""
+    project = _project(app)
+    if key is not None:
+        return _composition(project, key), "explicit"
+    compositions = list(project.compositions)
+    active = app.active_item
+    if active is not None:
+        for composition in compositions:
+            if composition.id == active.id:
+                return composition, "active_item"
+    for composition in compositions:
+        if getattr(composition, "selected", False):
+            return composition, "selected"
+    if compositions:
+        return compositions[0], "first"
+    raise HostScriptError("After Effects has no composition to resolve")
+
+
+def _resolve_layer(composition: Any, key: Any) -> tuple[Any, str]:
+    """Resolve a layer explicitly, or fall back to the composition's selected layer."""
+    if key is not None:
+        return _layer(composition, key), "explicit"
+    layers = list(composition.layers)
+    selected = [value for value in layers if getattr(value, "selected", False)]
+    if len(selected) == 1:
+        return selected[0], "selected"
+    if len(selected) > 1:
+        raise HostScriptError(
+            f"After Effects composition has {len(selected)} selected layers; pass layer explicitly"
+        )
+    raise HostScriptError("After Effects has no selected layer to resolve")
+
+
 def inspect_project(*, app_factory=AfterEffects) -> dict[str, Any]:
     app = app_factory()
     project = _project(app)
@@ -198,21 +232,33 @@ def create_composition(
     return {"composition": _composition_data(composition), "created": True}
 
 
-def inspect_composition(composition: Any, *, app_factory=AfterEffects) -> dict[str, Any]:
-    value = _composition(_project(app_factory()), composition)
+def inspect_composition(composition: Any = None, *, app_factory=AfterEffects) -> dict[str, Any]:
+    app = app_factory()
+    value, resolved_via = _resolve_composition(app, composition)
     return {
         "composition": _composition_data(value),
+        "resolved_via": resolved_via,
         "layers": [_layer_data(layer) for layer in value.layers],
         "selected_layers": [_layer_data(layer) for layer in value.selected_layers],
     }
 
 
-def inspect_layer(composition: Any, layer: Any, *, app_factory=AfterEffects) -> dict[str, Any]:
-    comp = _composition(_project(app_factory()), composition)
-    value = _layer(comp, layer)
+def inspect_layer(
+    composition: Any = None,
+    layer: Any = None,
+    *,
+    app_factory=AfterEffects,
+) -> dict[str, Any]:
+    app = app_factory()
+    comp, composition_resolved_via = _resolve_composition(app, composition)
+    value, layer_resolved_via = _resolve_layer(comp, layer)
     source_text = value.source_text
     return {
         "layer": _layer_data(value),
+        "resolved_via": {
+            "composition": composition_resolved_via,
+            "layer": layer_resolved_via,
+        },
         "source_text": {
             "text": source_text.text,
             "font": source_text.font,
@@ -253,8 +299,8 @@ def inspect_layer(composition: Any, layer: Any, *, app_factory=AfterEffects) -> 
 
 
 def create_layer(
-    composition: Any,
-    layer_type: str,
+    composition: Any = None,
+    layer_type: str = "",
     *,
     text: str | None = None,
     name: str | None = None,
@@ -266,8 +312,9 @@ def create_layer(
     footage_item: Any = None,
     app_factory=AfterEffects,
 ) -> dict[str, Any]:
-    project = _project(app_factory())
-    comp = _composition(project, composition)
+    app = app_factory()
+    project = _project(app)
+    comp, resolved_via = _resolve_composition(app, composition)
     if layer_type == "text":
         if text is None:
             raise ValueError("text is required for a text layer")
@@ -292,12 +339,12 @@ def create_layer(
         value = comp.add_footage_layer(item, duration=duration)
     else:
         raise ValueError(f"Unsupported layer type: {layer_type}")
-    return {"layer": _layer_data(value), "created": True}
+    return {"layer": _layer_data(value), "resolved_via": resolved_via, "created": True}
 
 
 def update_layer(
-    composition: Any,
-    layer: Any,
+    composition: Any = None,
+    layer: Any = None,
     *,
     text: str | None = None,
     text_properties: dict[str, Any] | None = None,
@@ -312,8 +359,9 @@ def update_layer(
     relative_to: Any = None,
     app_factory=AfterEffects,
 ) -> dict[str, Any]:
-    comp = _composition(_project(app_factory()), composition)
-    value = _layer(comp, layer)
+    app = app_factory()
+    comp, composition_resolved_via = _resolve_composition(app, composition)
+    value, layer_resolved_via = _resolve_layer(comp, layer)
     if text is not None:
         value.set_source_text(text, **(text_properties or {}))
     if any(item is not None for item in (position, scale, rotation, opacity, anchor_point)):
@@ -339,7 +387,14 @@ def update_layer(
         value = value.move_before(target) if move == "before" else value.move_after(target)
     elif move is not None:
         raise ValueError(f"Unsupported layer move: {move}")
-    return {"layer": _layer_data(value), "updated": True}
+    return {
+        "layer": _layer_data(value),
+        "resolved_via": {
+            "composition": composition_resolved_via,
+            "layer": layer_resolved_via,
+        },
+        "updated": True,
+    }
 
 
 def _render_item_data(item: Any) -> dict[str, Any]:
@@ -386,7 +441,7 @@ def inspect_render_queue(*, app_factory=AfterEffects) -> dict[str, Any]:
 
 
 def queue_composition(
-    composition: Any,
+    composition: Any = None,
     *,
     render_settings_template: str | None = None,
     output_module_template: str | None = None,
@@ -394,14 +449,15 @@ def queue_composition(
     settings: dict[str, Any] | None = None,
     app_factory=AfterEffects,
 ) -> dict[str, Any]:
-    comp = _composition(_project(app_factory()), composition)
+    app = app_factory()
+    comp, resolved_via = _resolve_composition(app, composition)
     item = comp.add_to_render_queue(
         render_settings_template=render_settings_template,
         output_module_template=output_module_template,
         output_path=_absolute_path(output_path) if output_path else None,
         **(settings or {}),
     )
-    return {"item": _render_item_data(item), "queued": True}
+    return {"item": _render_item_data(item), "resolved_via": resolved_via, "queued": True}
 
 
 def control_render_queue(
