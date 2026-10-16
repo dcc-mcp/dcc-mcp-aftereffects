@@ -13,9 +13,11 @@ tools:
     description: Add a composition to the render queue with optional templates and output path.
     input_schema:
       type: object
-      required: [composition]
       properties:
-        composition: {description: Composition id, index, or exact name.}
+        composition:
+          description: >-
+            Composition id, index, or exact name. Omit to resolve the active
+            composition, then the selected one, then the first.
         render_settings_template: {type: string}
         output_module_template: {type: string}
         output_path: {type: string, description: Absolute output path.}

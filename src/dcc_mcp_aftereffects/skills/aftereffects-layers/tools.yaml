@@ -3,8 +3,11 @@ tools:
     description: Inspect one composition and its complete and selected layer lists.
     input_schema:
       type: object
-      required: [composition]
-      properties: {composition: {description: Composition id, index, or exact name.}}
+      properties:
+        composition:
+          description: >-
+            Composition id, index, or exact name. Omit to resolve the active
+            composition, then the selected one, then the first.
     read_only: true
     destructive: false
     idempotent: true
@@ -16,10 +19,15 @@ tools:
     description: Inspect layer metadata, source text, effects, and masks.
     input_schema:
       type: object
-      required: [composition, layer]
       properties:
-        composition: {description: Composition id, index, or exact name.}
-        layer: {description: Layer id, index, or exact name.}
+        composition:
+          description: >-
+            Composition id, index, or exact name. Omit to resolve the active
+            composition, then the selected one, then the first.
+        layer:
+          description: >-
+            Layer id, index, or exact name. Omit to resolve the composition's
+            single selected layer.
     read_only: true
     destructive: false
     idempotent: true
@@ -31,9 +39,12 @@ tools:
     description: Create a text, solid, or footage layer in a composition.
     input_schema:
       type: object
-      required: [composition, layer_type]
+      required: [layer_type]
       properties:
-        composition: {description: Composition id, index, or exact name.}
+        composition:
+          description: >-
+            Composition id, index, or exact name. Omit to resolve the active
+            composition, then the selected one, then the first.
         layer_type: {type: string, enum: [text, solid, footage]}
         text: {type: string}
         name: {type: string}
@@ -54,10 +65,15 @@ tools:
     description: Update text, transform, keyframes, or stacking order for one layer.
     input_schema:
       type: object
-      required: [composition, layer]
       properties:
-        composition: {description: Composition id, index, or exact name.}
-        layer: {description: Layer id, index, or exact name.}
+        composition:
+          description: >-
+            Composition id, index, or exact name. Omit to resolve the active
+            composition, then the selected one, then the first.
+        layer:
+          description: >-
+            Layer id, index, or exact name. Omit to resolve the composition's
+            single selected layer.
         text: {type: string}
         text_properties: {type: object}
         position: {type: array, items: {type: number}}
