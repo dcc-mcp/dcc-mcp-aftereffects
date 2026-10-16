@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 from adobe.core.dom import DomObject
+from adobe.core.errors import HostScriptError
 
 from dcc_mcp_aftereffects.operations import (
     TOOL_NAMESPACE_COVERAGE,
@@ -187,13 +189,17 @@ def test_layer_tools_cover_details_creation_transform_keyframes_and_order():
     app_factory = mock.Mock(return_value=SimpleNamespace(project=project))
 
     assert inspect_composition(1, app_factory=app_factory)["layers"][0]["name"] == "Title"
+    explicit = inspect_composition(1, app_factory=app_factory)
+    assert explicit["resolved_via"] == "explicit"
     details = inspect_layer(1, 10, app_factory=app_factory)
     assert details["source_text"]["text"] == "Hello"
     assert details["effects"][0]["name"] == "Glow"
     assert details["masks"][0]["name"] == "Mask 1"
+    assert details["resolved_via"] == {"composition": "explicit", "layer": "explicit"}
 
     created = create_layer(1, "solid", color=[1, 0, 0], app_factory=app_factory)
     assert created["layer"]["name"] == "Solid"
+    assert created["resolved_via"] == "explicit"
     composition.add_solid_layer.assert_called_once()
 
     result = update_layer(
@@ -207,6 +213,7 @@ def test_layer_tools_cover_details_creation_transform_keyframes_and_order():
         app_factory=app_factory,
     )
     assert result["layer"]["name"] == "Updated"
+    assert result["resolved_via"] == {"composition": "explicit", "layer": "explicit"}
     text_layer.set_source_text.assert_called_once_with("Updated")
     text_layer.set_transform.assert_called_once_with(
         position=[100, 200], scale=None, rotation=None, opacity=None, anchor_point=None
@@ -278,3 +285,111 @@ def test_official_dom_round_trips_opaque_refs_and_raw_fallback():
 
     assert evaluate_extend_script("1 + 1", app_factory=app_factory) == {"result": {"ok": True}}
     raw.eval_extend_script.assert_called_once_with("1 + 1", timeout_ms=None)
+
+
+def _app_with(compositions, active_item=None):
+    project = SimpleNamespace(
+        items=list(compositions),
+        compositions=list(compositions),
+        footage_items=[],
+        folders=[],
+        selected_items=[],
+    )
+    return mock.Mock(
+        return_value=SimpleNamespace(project=project, active_item=active_item, selected_items=[])
+    )
+
+
+def _resolvable_composition(**overrides):
+    values = {
+        "num_layers": 1,
+        "work_area_start": 0.0,
+        "work_area_duration": 5.0,
+        "layers": [],
+        "selected_layers": [],
+        "get_layer_by_id": mock.Mock(return_value=None),
+    }
+    values.update(overrides)
+    return item(**values)
+
+
+def test_composition_resolution_falls_back_to_active_then_selected_then_first():
+    active = _resolvable_composition(id=1, name="Active")
+    second = _resolvable_composition(id=2, name="Second", selected=True)
+
+    active_app = _app_with([second, active], active_item=active)
+    result = inspect_composition(app_factory=active_app)
+    assert result["composition"]["name"] == "Active"
+    assert result["resolved_via"] == "active_item"
+
+    selected_app = _app_with([second, active])
+    result = inspect_composition(app_factory=selected_app)
+    assert result["composition"]["name"] == "Second"
+    assert result["resolved_via"] == "selected"
+
+    first_app = _app_with([active, _resolvable_composition(id=2, name="Later")])
+    result = inspect_composition(app_factory=first_app)
+    assert result["composition"]["name"] == "Active"
+    assert result["resolved_via"] == "first"
+
+
+def test_composition_resolution_without_candidates_reports_a_host_error():
+    app_factory = _app_with([])
+    with pytest.raises(HostScriptError, match="no composition to resolve"):
+        inspect_composition(app_factory=app_factory)
+
+
+def test_layer_resolution_uses_the_single_selected_layer():
+    selected = layer(
+        id=10,
+        name="Selected",
+        selected=True,
+        source_text=None,
+        effects=[],
+        masks=[],
+    )
+    other = layer(id=11, name="Other", selected=False)
+    composition = _resolvable_composition(
+        id=1, name="Main", layers=[other, selected], selected_layers=[selected]
+    )
+    app_factory = _app_with([composition], active_item=composition)
+
+    result = inspect_layer(app_factory=app_factory)
+    assert result["layer"]["name"] == "Selected"
+    assert result["resolved_via"] == {"composition": "active_item", "layer": "selected"}
+
+
+def test_layer_resolution_rejects_ambiguous_selection_and_empty_selection():
+    first = layer(id=10, name="First", selected=True)
+    second = layer(id=11, name="Second", selected=True)
+    multiple = _resolvable_composition(
+        id=1, name="Multiple", layers=[first, second], selected_layers=[first, second]
+    )
+    with pytest.raises(HostScriptError, match="2 selected layers"):
+        inspect_layer(1, app_factory=_app_with([multiple], active_item=multiple))
+
+    unselected = layer(id=12, name="Unselected", selected=False)
+    none = _resolvable_composition(id=2, name="None", layers=[unselected], selected_layers=[])
+    with pytest.raises(HostScriptError, match="no selected layer"):
+        inspect_layer(2, app_factory=_app_with([none], active_item=none))
+
+
+def test_mutation_and_render_tools_inherit_composition_resolution():
+    solid = layer(id=11, name="Solid", layer_type="solid", is_text=False)
+    composition = _resolvable_composition(
+        id=1,
+        name="Main",
+        layers=[layer(id=10, name="Title", selected=True)],
+        selected_layers=[layer(id=10, name="Title", selected=True)],
+        add_solid_layer=mock.Mock(return_value=solid),
+        add_to_render_queue=mock.Mock(return_value=render_item()),
+    )
+    app_factory = _app_with([composition], active_item=composition)
+
+    created = create_layer(layer_type="solid", color=[1, 0, 0], app_factory=app_factory)
+    assert created["resolved_via"] == "active_item"
+    composition.add_solid_layer.assert_called_once()
+
+    queued = queue_composition(app_factory=app_factory)
+    assert queued["resolved_via"] == "active_item"
+    composition.add_to_render_queue.assert_called_once()
