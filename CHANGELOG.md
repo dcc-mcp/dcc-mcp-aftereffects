@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.1...v0.7.2) (2026-10-14)
+
+
+### Documentation
+
+* refresh the generated DCC-MCP host matrix pointer ([f76d9dd](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/f76d9ddf5063557cca6ca74ceebb415faf8e1d99))
+* refresh the generated DCC-MCP host matrix pointer ([#25](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/25)) ([f33a246](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/f33a2461732344993e0baaa3ddb48c3f1f550bcb))
+
 ## [0.7.1](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.0...v0.7.1) (2026-10-09)
 
 
