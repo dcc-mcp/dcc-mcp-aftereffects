@@ -34,8 +34,8 @@ def test_adapter_uses_shared_adobepy_runtime():
     contents = pyproject_path.read_text(encoding="utf-8")
     adobepy = Requirement(re.search(r'"(adobepy[^"]+)"', contents).group(1))
 
-    assert str(adobepy.specifier) == "==0.6.2"
-    assert adobepy.specifier.contains("0.6.2")
+    assert str(adobepy.specifier) == "==0.12.0"
+    assert adobepy.specifier.contains("0.12.0")
     assert not adobepy.specifier.contains("0.8.0")
     assert '"dcc-mcp-core>=0.20.14,<1.0.0"' in contents
     assert not (root / "src" / "dcc_mcp_aftereffects" / "bridge.py").exists()

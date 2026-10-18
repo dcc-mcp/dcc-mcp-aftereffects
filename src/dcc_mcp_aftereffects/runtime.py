@@ -7,6 +7,8 @@ from typing import Any, Callable, Mapping
 
 from adobe.after_effects import AfterEffects
 from adobe.core import BrokerClient
+from adobe.core.errors import IdentityUnavailableError
+from adobe.core.runtime_identity import RuntimeIdentityAttestation
 
 REQUIRED_METHODS: Mapping[str, tuple[str, ...]] = {
     "app": ("getVersion", "openProject"),
@@ -105,6 +107,40 @@ def _missing_methods(capabilities: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _normalize_runtime_identity(value: object) -> dict[str, Any] | None:
+    """Validate the published SDK attestation before adapting the receipt schema."""
+    try:
+        if isinstance(value, RuntimeIdentityAttestation):
+            # Dataclasses can be constructed directly; validate them as strictly as wire data.
+            value = value.to_wire()
+        attestation = RuntimeIdentityAttestation.from_broker(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    broker, host, bridge = attestation.broker, attestation.host, attestation.bridge
+    return {
+        "host": "after-effects",
+        "host_pid": host.pid,
+        "process_start_identity": host.process_start_identity,
+        "process_executable": host.executable_path,
+        "host_version": host.host_version,
+        "profile_id": host.profile_id,
+        "target": bridge.target,
+        "bridge_kind": bridge.bridge_kind,
+        "bridge_version": bridge.bridge_version,
+        "instance_id": bridge.instance_id,
+        "plugin_root": bridge.installed_plugin_root,
+        "plugin_module_origin": bridge.module_origin,
+        "connected_at_epoch_ms": bridge.connected_at_epoch_ms,
+        "broker": {
+            "pid": broker.pid,
+            "process_start_identity": broker.process_start_identity,
+            "executable": broker.executable_path,
+            "version": broker.runtime_version,
+            "instance_id": broker.instance_id,
+        },
+    }
+
+
 def probe_aftereffects(
     *,
     broker_url: str | None = None,
@@ -153,6 +189,13 @@ def probe_aftereffects(
         version = str(app.version)
         runtime_identity = getattr(app, "runtime_identity", None)
         identity = runtime_identity() if callable(runtime_identity) else runtime_identity
+    except IdentityUnavailableError:
+        return AfterEffectsStatus(
+            False,
+            "adobepy has no trusted After Effects CEP runtime identity",
+            target=target,
+            error_type="runtime_identity_unavailable",
+        )
     except Exception:  # noqa: BLE001 - readiness reports stable host failures
         return AfterEffectsStatus(
             False,
@@ -160,13 +203,26 @@ def probe_aftereffects(
             target=target,
             error_type="host_rpc_failed",
         )
-    if not isinstance(identity, Mapping):
+    identity = _normalize_runtime_identity(identity)
+    if identity is None:
         return AfterEffectsStatus(
             False,
             "adobepy did not attest the exact After Effects CEP runtime identity",
             version=version,
             target=target,
             error_type="runtime_identity_unavailable",
+        )
+    if (
+        identity["target"] != target
+        or identity["bridge_kind"] != "cep"
+        or identity["host_version"] != version
+    ):
+        return AfterEffectsStatus(
+            False,
+            "The runtime identity does not match the selected After Effects session",
+            version=version,
+            target=target,
+            error_type="runtime_identity_mismatch",
         )
     return AfterEffectsStatus(
         True,

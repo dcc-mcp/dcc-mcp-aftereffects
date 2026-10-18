@@ -17,18 +17,18 @@ point and do not claim catalog installation is complete.
 - **Python:** 3.9 or newer for the adapter sidecar; this is not After Effects'
   embedded ExtendScript runtime.
 - **dcc-mcp-core:** `>=0.20.14,<1.0.0` in the selected Python environment.
-- **adobepy:** Python SDK 0.6.2 plus the matching audited `adobepy` CLI binary.
+- **adobepy:** Python SDK 0.12.0 plus the matching audited `adobepy` CLI binary.
 - **Authentication:** one non-empty `ADOBEPY_TOKEN` shared by the broker and
   CEP bridge.
 - **Permissions:** write access to the current user's CEP extension and
   DCC-MCP state directories.
 
 The PyPI `adobepy` wheel contains the Python SDK, not the Rust CLI. On Windows,
-use the official `adobepy-v0.6.2` release asset
-`adobepy-0.6.2-windows-x64.zip`. The adapter pins its published archive SHA-256
-`9ef9abb5e034359f12e9ce248b0030e38d34c76df343eb2713f18036068719a7`
+use the official `adobepy-v0.12.0` release asset
+`adobepy-0.12.0-windows-x64.zip`. The adapter pins its published archive SHA-256
+`b7c4923b474f01447f6f05666a8bd48c0beb4e0b7409b2842e1b506d1f12b48a`
 and the extracted `bin/adobepy.exe` SHA-256
-`c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa`.
+`5ab96c36a913bd39a30af5d77ee3af17e5e080a50d1a27823be97a4eee67bf0d`.
 Set `ADOBEPY_CLI` to that executable. An optional `ADOBEPY_CLI_SHA256` must equal
 the pinned executable digest; it cannot introduce a new trust root. The
 package-owned digest map binds the selected versioned asset, bounded manifest,
@@ -140,6 +140,14 @@ All lifecycle verbs accept the uniform flags `--json`, `--yes`, `--dry-run`,
 7. Run the verification sequence below. If the official runtime cannot expose
    exact PID/start/executable/profile/CEP-module identity, verification fails
    closed instead of treating a broker socket or manual UI claim as readiness.
+
+The official CEP layout is `CSXS/manifest.xml`. The adapter consumes adobepy
+0.12.0's validated typed runtime identity and uses canonical OS process-start
+tokens. However, adobepy 0.12.0 still returns `ERROR_IDENTITY_UNAVAILABLE` for
+After Effects until trusted CEP launch-receipt/bootstrap plumbing exists. This
+migration preserves that failure: it does not establish live After Effects
+readiness. CI verifies SDK compatibility with synthetic broker responses, not a
+licensed live host.
 
 An existing target without a matching receipt is `partial`; install and upgrade
 preserve it and fail closed instead of guessing ownership. Upgrade keeps the old

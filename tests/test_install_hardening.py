@@ -1271,7 +1271,7 @@ def test_python_module_byte_drift_stops_before_staging_or_installer(
         for key, distribution, version in (
             ("adapter", "dcc-mcp-aftereffects", "0.7.0"),
             ("core", "dcc-mcp-core", "0.20.21"),
-            ("adobepy", "adobepy", "0.6.2"),
+            ("adobepy", "adobepy", "0.12.0"),
         )
     }
     resolved = replace(resolved_install(tmp_path), python_modules=captured)
@@ -3090,9 +3090,9 @@ def test_acquire_failure_has_pinned_executable_windows_remediation(
         "-NonInteractive",
         "-Command",
     ]
-    assert "adobepy-v0.6.2" in acquire[4]
-    assert "9ef9abb5e034359f12e9ce248b0030e38d34c76df343eb2713f18036068719a7" in acquire[4]
-    assert "c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa" in acquire[4]
+    assert "adobepy-v0.12.0" in acquire[4]
+    assert "b7c4923b474f01447f6f05666a8bd48c0beb4e0b7409b2842e1b506d1f12b48a" in acquire[4]
+    assert "5ab96c36a913bd39a30af5d77ee3af17e5e080a50d1a27823be97a4eee67bf0d" in acquire[4]
     assert retry == [
         "dcc-mcp-aftereffects",
         "install",
