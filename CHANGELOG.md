@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.3](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.2...v0.7.3) (2026-10-18)
+
+
+### Bug Fixes
+
+* **deps:** pair adapter with adobepy 0.12.0 ([#28](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/28)) ([31d57b5](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/31d57b57ce9c8ff910c5ad0c47d24fa38cbb629b))
+
 ## [0.7.2](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.1...v0.7.2) (2026-10-14)
 
 
