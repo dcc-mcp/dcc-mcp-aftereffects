@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from dcc_mcp_core.deployment import install_sop as _install_sop
 
-# `INSTALL_SOP_SCHEMA_VERSION` is the revision of the published Install SOP
-# schema *artifact* (`adapter-install-sop-vN.schema.json`), 2 since
-# dcc-mcp-core 0.20.36. It is NOT the value of the `schema_version` field that
-# the artifact pins on a report document: that field is a separate, stable
-# counter declared as `properties.schema_version.const` and stays at 1, because
-# artifact revisions only add optional members. The two are named separately
-# here -- conflating them makes every doctor/verify/install report fail
-# validation the moment the resolved core advances.
-ARTIFACT_SCHEMA_VERSION = _install_sop.INSTALL_SOP_SCHEMA_VERSION
+# The report document's `schema_version` field (SCHEMA_VERSION, below) is a
+# stable const pinned by the published Install SOP schema, NOT the revision of
+# the schema *artifact* (`adapter-install-sop-vN.schema.json`). The artifact
+# revision is a separate counter -- 2 since dcc-mcp-core 0.20.36, renamed
+# `INSTALL_SOP_SCHEMA_REVISION` from 0.20.40 (old alias
+# `INSTALL_SOP_SCHEMA_VERSION`) -- that moves independently, because an artifact
+# revision only ever adds optional members and so never changes what a document
+# means. Conflating the two -- emitting the artifact revision as
+# `schema_version` -- makes every doctor/verify/install report fail validation
+# the moment the resolved core advances. Nothing in this adapter reads the
+# artifact revision, so it is deliberately not mirrored here: re-exporting it
+# would only add a second binding to rename the next time Core moves it.
 
 # Value of the report document's own `schema_version` field, i.e. the `const`
 # the published Install SOP schema enforces. Kept in sync with
@@ -96,7 +99,6 @@ def report_schema_version() -> int:
 
 
 __all__ = [
-    "ARTIFACT_SCHEMA_VERSION",
     "EXIT_ACQUIRE",
     "EXIT_INSTALL",
     "EXIT_OK",
