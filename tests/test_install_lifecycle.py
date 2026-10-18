@@ -33,7 +33,12 @@ class BridgeRunner:
         self.calls.append((command, kwargs))
         destination = Path(command[command.index("--dest") + 1])
         destination.mkdir(parents=True, exist_ok=True)
+        # Keep the root file as generic rollback-test payload; CEP uses CSXS below.
         (destination / "manifest.xml").write_text("<ExtensionManifest />", encoding="utf-8")
+        (destination / "CSXS").mkdir(exist_ok=True)
+        (destination / "CSXS" / "manifest.xml").write_text(
+            "<ExtensionManifest />", encoding="utf-8"
+        )
         (destination / "adobepy.config.js").write_text(
             f"globalThis.__ADOBEPY_TOKEN='{kwargs['env']['ADOBEPY_TOKEN']}';",
             encoding="utf-8",
@@ -59,7 +64,7 @@ def _python_module_identities(tmp_path: Path) -> dict[str, object]:
     for key, distribution, version, package in (
         ("adapter", "dcc-mcp-aftereffects", "0.7.0", "dcc_mcp_aftereffects"),
         ("core", "dcc-mcp-core", "0.20.21", "dcc_mcp_core"),
-        ("adobepy", "adobepy", "0.6.2", "adobe.after_effects"),
+        ("adobepy", "adobepy", "0.12.0", "adobe.after_effects"),
     ):
         relative = Path(*package.split(".")) / "__init__.py"
         module = root / relative
@@ -116,7 +121,7 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
     )
     signature_helper.parent.mkdir(parents=True)
     signature_helper.write_bytes(b"powershell")
-    bridge_bundle = tmp_path / "adobepy-0.6.2-windows-x64"
+    bridge_bundle = tmp_path / "adobepy-0.12.0-windows-x64"
     bridge_cli = bridge_bundle / "bin" / "adobepy.exe"
     bridge_cli.parent.mkdir(parents=True)
     bridge_cli.write_bytes(b"cli")
@@ -125,7 +130,7 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
         json.dumps(
             {
                 "name": "adobepy",
-                "version": "0.6.2",
+                "version": "0.12.0",
                 "runtime": "windows-x64",
                 "includes": ["bin/adobepy.exe"],
             }
@@ -151,7 +156,7 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
         target="default",
         bridge_identity={
             "executable": str(bridge_cli.resolve()),
-            "version": "0.6.2",
+            "version": "0.12.0",
             "runtime": "windows-x64",
             "bytes": len(cli_bytes),
             "sha256": hashlib.sha256(cli_bytes).hexdigest(),
@@ -201,7 +206,7 @@ def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
                 "bridge_kind": "cep",
                 "target": resolved.target,
                 "host_version": resolved.host_version,
-                "bridge_version": "0.6.2",
+                "bridge_version": "0.12.0",
                 "host_pid": host_pid,
                 "process_start_identity": "test-host-start:41001",
                 "process_executable": str(resolved.host_path),
@@ -214,7 +219,7 @@ def healthy_dependencies(runner: BridgeRunner) -> LifecycleDependencies:
                     "pid": broker_pid,
                     "process_start_identity": "test-broker-start:41002",
                     "executable": str(resolved.adobepy_cli),
-                    "version": "0.6.2",
+                    "version": "0.12.0",
                     "instance_id": "adobepy-test-instance",
                 },
             },

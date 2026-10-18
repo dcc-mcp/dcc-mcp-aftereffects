@@ -110,7 +110,10 @@ direct endpoint is required.
 Set `ADOBEPY_TOKEN` to the same non-default token used when installing the bridge.
 
 The adapter reports ready only after the target After Effects bridge advertises
-the complete typed/official-DOM contract and a real host version RPC succeeds.
+the complete typed/official-DOM contract, a real host version RPC succeeds, and
+trusted runtime identity is available. adobepy 0.12.0 still rejects After Effects
+identity until CEP launch-receipt/bootstrap support exists, so readiness remains
+fail-closed. The dependency update does not claim live-host support.
 A broker process is stopped only when it was started by this adapter.
 
 ## Skill groups

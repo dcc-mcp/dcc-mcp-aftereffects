@@ -34,7 +34,7 @@ from .install_models import InstallRequest, ResolvedInstall
 MIN_HOST_VERSION = Version("24.0")
 MIN_PYTHON_VERSION = Version("3.9")
 MIN_CORE_VERSION = Version("0.20.14")
-MIN_ADOBEPY_VERSION = Version("0.6.2")
+MIN_ADOBEPY_VERSION = Version("0.12.0")
 _MAX_VERSION_LENGTH = 39
 _FINAL_VERSION = re.compile(
     r"(0|[1-9][0-9]{0,8})(?:\.(0|[1-9][0-9]{0,8}))?"
@@ -50,14 +50,14 @@ _MAX_PYTHON_MODULE_BYTES = 32 * 1024 * 1024
 _MAX_DISTRIBUTION_METADATA_BYTES = 16 * 1024 * 1024
 _MAX_DISTRIBUTION_METADATA_FILES = 256
 _PUBLISHED_ADOBEPY_RELEASES: dict[tuple[str, str], dict[str, str]] = {
-    ("0.6.2", "windows-x64"): {
-        "cli_sha256": "c02f28f07705b69a4f97f9f6639f0f80d1f5292115446801fbd92423336301aa",
-        "cli_bytes": "2974720",
-        "manifest_sha256": "3f0cf14b44b1d4c7d98b0175152e7ea58fc3edb92bd61e84983b3ad39de6b554",
-        "manifest_bytes": "663",
-        "archive_sha256": "9ef9abb5e034359f12e9ce248b0030e38d34c76df343eb2713f18036068719a7",
-        "release_tag": "adobepy-v0.6.2",
-        "asset": "adobepy-0.6.2-windows-x64.zip",
+    ("0.12.0", "windows-x64"): {
+        "cli_sha256": "5ab96c36a913bd39a30af5d77ee3af17e5e080a50d1a27823be97a4eee67bf0d",
+        "cli_bytes": "4945920",
+        "manifest_sha256": "9a19ef5517e570070f20d95d876dd68c5cc6f0073c04a0855e2b7f095060713a",
+        "manifest_bytes": "815",
+        "archive_sha256": "b7c4923b474f01447f6f05666a8bd48c0beb4e0b7409b2842e1b506d1f12b48a",
+        "release_tag": "adobepy-v0.12.0",
+        "asset": "adobepy-0.12.0-windows-x64.zip",
     }
 }
 

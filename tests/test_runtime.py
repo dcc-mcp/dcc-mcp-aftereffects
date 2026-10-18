@@ -40,20 +40,25 @@ def test_probe_requires_complete_bridge_contract():
 
 
 def test_probe_verifies_a_real_host_call():
+    from adobe.core.runtime_identity import RuntimeIdentityAttestation
+    from test_adobepy_compat import identity_wire
+
     client = SimpleNamespace(capabilities=lambda: capability_payload())
 
     status = probe_aftereffects(
         client=client,
         app_factory=lambda **_kwargs: SimpleNamespace(
             version="24.6.2",
-            runtime_identity={"host": "after-effects", "bridge_kind": "cep"},
+            runtime_identity=RuntimeIdentityAttestation.from_broker(identity_wire()),
         ),
     )
 
     assert status.ready is True
     assert status.version == "24.6.2"
     assert status.target == "default"
-    assert status.identity == {"host": "after-effects", "bridge_kind": "cep"}
+    assert status.identity["host"] == "after-effects"
+    assert status.identity["bridge_kind"] == "cep"
+    assert status.identity["broker"]["version"] == "0.12.0"
 
 
 def test_probe_reports_host_call_failure_without_claiming_readiness():
