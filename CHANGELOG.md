@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.3...v0.8.0) (2026-10-19)
+
+
+### Features
+
+* resolve active comp and selected layer by default ([c60aaa2](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/c60aaa205475813005dee71fefee75d5de1d0a41))
+
 ## [0.7.3](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.2...v0.7.3) (2026-10-18)
 
 
