@@ -654,20 +654,29 @@ def test_host_override_rejects_unsigned_afterfx_spoof(
         _resolve_host(InstallRequest("status", dcc_path=str(spoof)), "win32", {})
 
 
-def test_powershell_single_quoted_escapes_embedded_quotes() -> None:
-    assert install_discovery._powershell_single_quoted(r"C:\O'Brien\AfterFX.exe") == (
-        r"'C:\O''Brien\AfterFX.exe'"
-    )
+def test_powershell_base64_literal_is_pure_ascii_and_round_trips() -> None:
+    # The literal must carry arbitrary path text as inert ASCII data: no quote
+    # (ASCII or smart), no separator, no statement text can reach -Command.
+    value = r"C:\Program Files\O'Brien\After Effects’ ; Set-Content pwned; #"
+    literal = install_discovery._powershell_base64_literal(value)
+    assert literal.startswith("'") and literal.endswith("'")
+    encoded = literal[1:-1]
+    assert encoded.isascii()
+    assert "’" not in literal
+    assert "'" not in encoded
+    assert base64.b64decode(encoded).decode("utf-8") == value
 
 
-def test_windows_probe_inlines_host_path_and_forces_utf8_output(
+def test_windows_probe_base64_encodes_host_path_and_forces_utf8_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression for GH #32: never pass the host path after `-Command <script>`.
 
     Windows PowerShell joins trailing arguments into the command text and leaves
-    `$args[0]` null, so the path must be inlined. Output is pinned to UTF-8 so a
-    non-ASCII PowerShell `ProductName` survives a non-UTF-8 console.
+    `$args[0]` null, so the path must be carried inside the script. It is encoded
+    as ASCII Base64 (never raw) so no path character can be parsed as PowerShell.
+    Output is pinned to UTF-8 so a non-ASCII `ProductName` survives a non-UTF-8
+    console.
     """
     helper = tmp_path / "Windows" / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     helper.parent.mkdir(parents=True)
@@ -709,9 +718,84 @@ def test_windows_probe_inlines_host_path_and_forces_utf8_output(
     assert len(command) == 5
     assert str(host) not in command
     assert "$args[0]" not in script
-    assert install_discovery._powershell_single_quoted(str(host)) in script
+    # The raw path never appears in the script; only its Base64 form does.
+    assert str(host) not in script
+    assert "FromBase64String" in script
+    literal = install_discovery._powershell_base64_literal(str(host))
+    assert literal in script
+    assert base64.b64decode(literal[1:-1]).decode("utf-8") == str(host)
     assert "OutputEncoding" in script
     assert captured["kwargs"].get("encoding") == "utf-8"
+
+
+def test_windows_probe_never_executes_smart_quote_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 regression: a `’` (U+2019) in --dcc-path must not become PowerShell.
+
+    Windows PowerShell 5.1 treats Unicode smart quotes as single-quote
+    delimiters, so inlining raw path text let a crafted path escape the string
+    and run attacker statements before any signature check. The path is carried
+    as ASCII Base64 data instead, and this proves no injected statement survives
+    into the command text or executes.
+    """
+    helper = tmp_path / "Windows" / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-helper")
+    marker = tmp_path / "pwned_marker.txt"
+    injection = f" ; Set-Content -LiteralPath '{marker}' -Value pwned ; #"
+    hostile = r"C:\Program Files\Adobe\AfterFX.exe" + "\u2019" + injection
+    host = Path(hostile)
+    captured: dict = {}
+
+    def run(command, **kwargs):
+        captured["command"] = [str(item) for item in command]
+        captured.setdefault("calls", 0)
+        captured["calls"] += 1
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(
+                {
+                    "helperStatus": "Valid",
+                    "helperSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                    "helperProduct": "Windows PowerShell",
+                    "helperOriginal": "powershell.exe",
+                    "helperVersion": "10.0.26100.1",
+                    "status": "Valid",
+                    "subject": "CN=Adobe Inc., O=Adobe Inc.",
+                    "product": "Adobe After Effects 2025",
+                    "original": "AfterFX.exe",
+                    "version": "25.6",
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(install_discovery.subprocess, "run", run)
+    evidence = install_discovery._verified_host_evidence(host, "win32", helper)
+
+    # Exactly one subprocess invocation: no injected command is spawned.
+    assert captured["calls"] == 1
+    command = captured["command"]
+    script = command[-1]
+    assert len(command) == 5
+    assert "$args[0]" not in script
+    # The command text is pure ASCII: no smart quote, no raw path, no statement
+    # payload can be parsed as PowerShell source.
+    assert script.isascii()
+    assert "\u2019" not in script
+    assert str(host) not in script
+    assert "Set-Content" not in script
+    assert str(marker) not in script
+    assert "FromBase64String" in script
+    literal = install_discovery._powershell_base64_literal(str(host))
+    assert literal in script
+    assert base64.b64decode(literal[1:-1]).decode("utf-8") == str(host)
+    # The probe completes normally (or rejects) without running the injection.
+    assert evidence is not None
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
