@@ -343,26 +343,43 @@ def _host_binary(path: Path, platform: str) -> Path:
     return path
 
 
-def _powershell_single_quoted(value: str) -> str:
-    """Quote a value as a PowerShell single-quoted string literal."""
-    return "'" + value.replace("'", "''") + "'"
+def _powershell_base64_literal(value: str) -> str:
+    """Encode ``value`` as an ASCII Base64 PowerShell string literal.
+
+    Windows PowerShell 5.1 treats the ASCII single quote and Unicode smart
+    quotes (U+2018/U+2019) as string delimiters, so inlining raw path text into
+    a ``-Command`` script lets a crafted ``--dcc-path`` close the literal and
+    run arbitrary statements before any signature check. Base64 uses only
+    ``[A-Za-z0-9+/=]``: no quote, ``$``, backtick, or statement separator can
+    appear, so the encoded value is inert script data. The caller decodes it
+    back to the exact UTF-8 string inside the script (see
+    ``_verified_host_evidence``).
+    """
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"'{encoded}'"
 
 
 def _verified_host_evidence(
     path: Path, platform: str, helper: Path
 ) -> tuple[str, dict[str, str]] | None:
     if platform == "win32":
-        # Pass the host path as a single-quoted literal inlined into the command
-        # text. Windows PowerShell does not put arguments after `-Command <script>`
-        # into `$args`, so a trailing path would leave `$args[0]` null and break
-        # the probe. Force UTF-8 output so a non-ASCII PowerShell `ProductName`
-        # (e.g. the registered sign in "Microsoft® Windows® Operating System")
-        # survives a non-UTF-8 console instead of degrading to `?`.
+        # Carry the host path as ASCII Base64 instead of inlining raw path text
+        # into the `-Command` script. Windows PowerShell does not put arguments
+        # after `-Command <script>` into `$args`, but inlining the path directly
+        # is unsafe: PowerShell 5.1 also treats Unicode smart quotes
+        # (U+2018/U+2019) as string delimiters, so a crafted `--dcc-path` could
+        # close the literal and execute arbitrary statements before the
+        # Authenticode check. Base64 is pure `[A-Za-z0-9+/=]` and is decoded
+        # back to the exact UTF-8 path inside the script. Force UTF-8 output so
+        # a non-ASCII PowerShell `ProductName` (e.g. the registered sign in
+        # "Microsoft® Windows® Operating System") survives a non-UTF-8 console
+        # instead of degrading to `?`.
         script = (
             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
             "$self=Get-AuthenticodeSignature -LiteralPath $PSHOME\\powershell.exe;"
             "$selfv=(Get-Item -LiteralPath $PSHOME\\powershell.exe).VersionInfo;"
-            f"$p={_powershell_single_quoted(str(path))};"
+            "$p=[System.Text.Encoding]::UTF8.GetString("
+            f"[System.Convert]::FromBase64String({_powershell_base64_literal(str(path))}));"
             "$sig=Get-AuthenticodeSignature -LiteralPath $p;"
             "$v=(Get-Item -LiteralPath $p).VersionInfo;"
             "[pscustomobject]@{helperStatus=[string]$self.Status;"
