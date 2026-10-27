@@ -654,6 +654,66 @@ def test_host_override_rejects_unsigned_afterfx_spoof(
         _resolve_host(InstallRequest("status", dcc_path=str(spoof)), "win32", {})
 
 
+def test_powershell_single_quoted_escapes_embedded_quotes() -> None:
+    assert install_discovery._powershell_single_quoted(r"C:\O'Brien\AfterFX.exe") == (
+        r"'C:\O''Brien\AfterFX.exe'"
+    )
+
+
+def test_windows_probe_inlines_host_path_and_forces_utf8_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for GH #32: never pass the host path after `-Command <script>`.
+
+    Windows PowerShell joins trailing arguments into the command text and leaves
+    `$args[0]` null, so the path must be inlined. Output is pinned to UTF-8 so a
+    non-ASCII PowerShell `ProductName` survives a non-UTF-8 console.
+    """
+    helper = tmp_path / "Windows" / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-helper")
+    host = tmp_path / "Adobe After Effects 2025" / "Support Files" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZtrusted-afterfx")
+    captured: dict = {}
+
+    def run(command, **kwargs):
+        captured["command"] = [str(item) for item in command]
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(
+                {
+                    "helperStatus": "Valid",
+                    "helperSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                    "helperProduct": "Microsoft® Windows® Operating System",
+                    "helperOriginal": "powershell.exe",
+                    "helperVersion": "10.0.26100.1",
+                    "status": "Valid",
+                    "subject": "CN=Adobe Inc., O=Adobe Inc.",
+                    "product": "Adobe After Effects 2025",
+                    "original": "AfterFX.exe",
+                    "version": "25.6",
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(install_discovery.subprocess, "run", run)
+    evidence = install_discovery._verified_host_evidence(host, "win32", helper)
+
+    assert evidence is not None
+    command = captured["command"]
+    script = command[-1]
+    assert len(command) == 5
+    assert str(host) not in command
+    assert "$args[0]" not in script
+    assert install_discovery._powershell_single_quoted(str(host)) in script
+    assert "OutputEncoding" in script
+    assert captured["kwargs"].get("encoding") == "utf-8"
+
+
 @pytest.mark.parametrize(
     ("helper_product", "helper_original", "helper_is_valid"),
     [
@@ -661,6 +721,7 @@ def test_host_override_rejects_unsigned_afterfx_spoof(
         ("Microsoft Windows Operating System", "powershell.exe", True),
         ("Microsoft® Windows® Operating System", "PowerShell.EXE.MUI", True),
         ("Microsoft(R) Windows(R) Operating System", "powershell.exe.mui", True),
+        ("Microsoft? Windows? Operating System", "powershell.exe", True),
         ("Untrusted Windows PowerShell", "powershell.exe", False),
         ("Windows PowerShell", "powershell.exe.backup", False),
     ],

@@ -343,15 +343,28 @@ def _host_binary(path: Path, platform: str) -> Path:
     return path
 
 
+def _powershell_single_quoted(value: str) -> str:
+    """Quote a value as a PowerShell single-quoted string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _verified_host_evidence(
     path: Path, platform: str, helper: Path
 ) -> tuple[str, dict[str, str]] | None:
     if platform == "win32":
+        # Pass the host path as a single-quoted literal inlined into the command
+        # text. Windows PowerShell does not put arguments after `-Command <script>`
+        # into `$args`, so a trailing path would leave `$args[0]` null and break
+        # the probe. Force UTF-8 output so a non-ASCII PowerShell `ProductName`
+        # (e.g. the registered sign in "Microsoft® Windows® Operating System")
+        # survives a non-UTF-8 console instead of degrading to `?`.
         script = (
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
             "$self=Get-AuthenticodeSignature -LiteralPath $PSHOME\\powershell.exe;"
             "$selfv=(Get-Item -LiteralPath $PSHOME\\powershell.exe).VersionInfo;"
-            "$sig=Get-AuthenticodeSignature -LiteralPath $args[0];"
-            "$v=(Get-Item -LiteralPath $args[0]).VersionInfo;"
+            f"$p={_powershell_single_quoted(str(path))};"
+            "$sig=Get-AuthenticodeSignature -LiteralPath $p;"
+            "$v=(Get-Item -LiteralPath $p).VersionInfo;"
             "[pscustomobject]@{helperStatus=[string]$self.Status;"
             "helperSubject=[string]$self.SignerCertificate.Subject;"
             "helperProduct=[string]$selfv.ProductName;"
@@ -363,9 +376,10 @@ def _verified_host_evidence(
         )
         try:
             result = subprocess.run(
-                [str(helper), "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+                [str(helper), "-NoProfile", "-NonInteractive", "-Command", script],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=15,
                 check=False,
             )
@@ -382,8 +396,11 @@ def _verified_host_evidence(
                 flags=re.IGNORECASE,
             )
             is None
+            # `®`/`(R)` in the PowerShell product name can degrade to `?` on a
+            # non-UTF-8 console; accept all three markers (or none).
             or re.fullmatch(
-                r"(?:Windows PowerShell|Microsoft(?:®|\(R\))? Windows(?:®|\(R\))? Operating System)",
+                r"(?:Windows PowerShell|"
+                r"Microsoft(?:®|\(R\)|\?)? Windows(?:®|\(R\)|\?)? Operating System)",
                 str(payload.get("helperProduct", "")),
                 re.IGNORECASE,
             )
