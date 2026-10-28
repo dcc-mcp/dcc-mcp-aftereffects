@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.3...v0.8.0) (2026-10-28)
+
+
+### Features
+
+* resolve active comp and selected layer by default ([c60aaa2](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/c60aaa205475813005dee71fefee75d5de1d0a41))
+
+
+### Bug Fixes
+
+* **install:** encode Windows host path as Base64 to block PowerShell injection ([638439e](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/638439e9a77d4c0e2596a1a22a60f19e9f1fa484))
+* **install:** pass host path inline and decode the Windows probe as UTF-8 ([848be33](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/848be3354b3cc04aa747bb347da1b93d89b09fbb))
+
+
+### Documentation
+
+* refresh the generated DCC-MCP host matrix pointer ([9faa61a](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/9faa61a98809269eed2cd4683b1efd03411014db))
+
 ## [0.7.3](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.2...v0.7.3) (2026-10-18)
 
 
