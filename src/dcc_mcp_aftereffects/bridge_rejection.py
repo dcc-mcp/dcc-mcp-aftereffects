@@ -10,11 +10,16 @@ was invisible without a separate WebSocket handshake.
 This module turns such a rejection into a small, **public-safe** view that the
 Bridge panel, ``verify`` output and readiness logs can display: only a numeric
 code, a bounded human-readable message and validated field names are exposed.
-Broker free-form text is shown only when it is clean; otherwise a curated,
-public-safe message is used.  Tokens, local paths, opaque secrets and envelope
-diagnostics are never echoed, matching the adapter's existing redaction
-contract.  Surfacing a rejection is observability only - it never claims that
-launch-receipt / typed-identity connectivity exists.
+
+Public safety is enforced with a strict allowlist, never with a blacklist.
+Broker free-form ``message`` text is echoed verbatim only when its fully
+normalized form is byte-for-byte one of the public-safe literals shipped in
+this module.  Every other message - short credentials, opaque tokens, local
+paths, truncation survivors and envelope diagnostics - falls back to a curated
+message selected by the numeric ``code``.  A regex miss is never treated as
+proof that arbitrary broker text is safe.  Surfacing a rejection is
+observability only - it never claims that launch-receipt / typed-identity
+connectivity exists.
 """
 
 from __future__ import annotations
@@ -48,6 +53,17 @@ _CURATED_MESSAGES: Mapping[int, str] = {
 }
 _DEFAULT_MESSAGE = "The adobepy broker rejected the After Effects bridge session (fail-closed)"
 
+# The only broker free-form wording we allow to be echoed verbatim.  These are
+# literals owned by this module, not data supplied by the broker: matching is
+# exact, so attacker-controlled text can pass only if it equals one of them.
+# Keep this list small and curated; anything not listed falls back to the
+# code-selected message below.
+_KNOWN_SAFE_MESSAGES: frozenset[str] = frozenset(
+    {
+        "After Effects runtime identity requires an adapter-owned launch receipt",
+    }
+)
+
 
 def _valid_code(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -74,31 +90,52 @@ def _valid_missing_fields(value: Any) -> tuple[str, ...]:
     return tuple(fields)
 
 
-def _clean_text(raw: str) -> str:
-    return " ".join(_CONTROL_RE.sub(" ", raw).split())[:_MAX_MESSAGE_LEN].rstrip()
+def _normalize_text(raw: str) -> str:
+    """Collapse control characters and whitespace over the COMPLETE string.
+
+    Deliberately does NOT truncate.  Truncating before the safety decision can
+    cut an opaque secret down to a short fragment that no longer looks like a
+    secret (for example a 27-character prefix of a 32-character token) and
+    would otherwise be echoed.  Bounding happens only after the decision.
+    """
+    return " ".join(_CONTROL_RE.sub(" ", raw).split())
+
+
+def _curated_for(code: int | None) -> str:
+    return _CURATED_MESSAGES.get(code, _DEFAULT_MESSAGE) if code is not None else _DEFAULT_MESSAGE
 
 
 def public_message(raw: Any, *, token: str | None, code: int | None) -> str:
     """Return a public-safe message for a rejection, never raw unsafe text.
 
-    The broker's own ``message`` is useful when it is plain text (for example
-    "After Effects runtime identity requires an adapter-owned launch receipt"),
-    but it may embed a token, a local path or other diagnostics.  Show it only
-    when it is clean; otherwise fall back to a curated, public-safe message.
+    The broker's own ``message`` is echoed only when it is one of the exact,
+    curated public-safe literals in ``_KNOWN_SAFE_MESSAGES``.  Any other free
+    form text - short credentials such as ``Authorization: Basic <base64>`` or
+    ``api_key=<short>``, opaque token fragments surviving truncation, local
+    paths and envelope diagnostics - falls back to a curated message selected
+    by ``code``.
+
+    Safety is decided by the allowlist, not by a blacklist: a regex miss is
+    never taken as proof that arbitrary broker text is safe.  The regex checks
+    and configured-token check below are defence in depth only; they run on
+    the full, untruncated normalized text before any bounding.
     """
-    curated = (
-        _CURATED_MESSAGES.get(code, _DEFAULT_MESSAGE) if code is not None else _DEFAULT_MESSAGE
-    )
+    curated = _curated_for(code)
     if not isinstance(raw, str):
         return curated
-    text = _clean_text(raw)
+    text = _normalize_text(raw)
     if not text:
         return curated
+    # Defence in depth on the COMPLETE normalized text (never on a truncated
+    # excerpt).  These are not the safety gate - the allowlist below is.
     if token and token in text:
         return curated
     if _SECRET_RE.search(text) or _PATH_RE.search(text) or _OPAQUE_RE.search(text):
         return curated
-    return text
+    # Strict allowlist: the sole gate for echoing broker free-form text.
+    if text not in _KNOWN_SAFE_MESSAGES:
+        return curated
+    return text[:_MAX_MESSAGE_LEN].rstrip()
 
 
 @dataclass(frozen=True)

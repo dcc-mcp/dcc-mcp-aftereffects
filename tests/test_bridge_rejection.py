@@ -2,7 +2,10 @@
 
 Reproduces the ``-32010`` / ``adapterOwnedLaunchReceipt`` fail-closed scenario
 from the AE Bridge report without a separate WebSocket handshake, and asserts
-that the surfaced copy stays public-safe (no tokens, local paths or secrets).
+that the surfaced copy stays public-safe.  Broker free-form ``message`` text is
+never trusted: it is echoed only when it exactly matches a curated allowlist
+literal, so short credentials, opaque token fragments and local paths are
+always replaced by the code-selected public-safe message.
 """
 
 from types import SimpleNamespace
@@ -23,6 +26,11 @@ REJECTION_RPC = {
     "message": "After Effects runtime identity requires an adapter-owned launch receipt",
     "data": {"host": "after-effects", "missingFields": ["adapterOwnedLaunchReceipt"]},
 }
+
+CURATED_32010 = (
+    "After Effects runtime identity requires a trusted adapter-owned launch "
+    "receipt; the connection stays fail-closed"
+)
 
 
 def _rejection_exception():
@@ -77,27 +85,65 @@ def test_generic_failure_has_no_structured_rejection():
 
 
 @pytest.mark.parametrize(
-    "unsafe",
+    "unsafe, leaked",
     [
-        "private-token: no trusted launch receipt",
-        "rejected at C:/Users/secret/bridge.js",
-        "bearer abcdefghijklmnopqrstuvwxyz0123456789 rejected",
-        "credential=abcdefghijklmnopqrstuvwxyz0123456789",
+        # Shapes the old blacklist happened to catch.
+        ("private-token: no trusted launch receipt", "private-token"),
+        ("rejected at C:/Users/secret/bridge.js", "C:/Users/secret"),
+        (
+            "bearer abcdefghijklmnopqrstuvwxyz0123456789 rejected",
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+        ),
+        ("credential=abcdefghijklmnopqrstuvwxyz0123456789", "abcdefghijklmnopqrstuvwxyz0123456789"),
+        # Regression: explicit credential label with a SHORT value.  The old
+        # implementation echoed these verbatim because no blacklist regex hit.
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ("api_key=abcd1234 short", "abcd1234"),
+        ("password=hunter2; receipt missing", "hunter2"),
+        # Regression: long message whose tail is an opaque token.  The old
+        # implementation truncated to 220 chars FIRST, leaving a 27-character
+        # token prefix that no longer matched the >=28 character opaque rule.
+        ("Refused: " + "x " * 92 + "a" * 32, "a" * 27),
+        # Regression: arbitrary clean-looking free text is NOT echoed unless it
+        # is on the strict allowlist.  A regex miss is not proof of safety.
+        ("broker refused the session", "broker refused"),
+        ("connection rejected by adapter", "rejected by adapter"),
+        ("After Effects runtime identity requires a launch receipt (retry later)", "retry later"),
     ],
 )
-def test_public_message_never_echoes_secrets(unsafe):
+def test_public_message_never_echoes_untrusted_broker_text(unsafe, leaked):
     message = public_message(unsafe, token="private-token", code=-32010)
-    assert "private-token" not in message
-    assert "secret" not in message.lower()
-    assert "abcdefghijklmnopqrstuvwxyz0123456789" not in message
+    assert message == CURATED_32010
     assert "fail-closed" in message
+    assert leaked not in message
 
 
-def test_public_message_keeps_clean_broker_text():
+def test_public_message_only_echoes_allowlisted_broker_text():
+    # The canonical -32010 wording is the one exact literal allowed through.
     assert (
         public_message(REJECTION_RPC["message"], token=None, code=-32010)
-        == (REJECTION_RPC["message"])
+        == REJECTION_RPC["message"]
     )
+    # Surrounding whitespace is normalized away - still the same allowlisted
+    # literal, nothing attacker-controlled is echoed.
+    assert (
+        public_message(" " + REJECTION_RPC["message"] + " ", token=None, code=-32010)
+        == REJECTION_RPC["message"]
+    )
+    # Near misses (extra words or different wording) are not allowlisted.
+    for variant in (
+        REJECTION_RPC["message"] + " (retry later)",
+        REJECTION_RPC["message"].replace("adapter-owned", "trusted"),
+    ):
+        assert public_message(variant, token=None, code=-32010) == CURATED_32010
+
+
+def test_public_message_does_not_leak_truncated_token_fragment():
+    raw = "Refused: " + "x " * 92 + "a" * 32
+    message = public_message(raw, token=None, code=-32010)
+    assert message == CURATED_32010
+    assert "a" * 27 not in message
+    assert "x " * 10 not in message
 
 
 def test_public_message_redacts_the_configured_token():
@@ -189,6 +235,41 @@ def test_secret_bearing_broker_message_stays_redacted_but_code_is_shown():
 
     assert "private-token" not in status.reason
     assert "private-token" not in status.rejection["message"]
+    assert "-32010" in status.reason
+    assert "adapterOwnedLaunchReceipt" in status.reason
+    assert "fail-closed" in status.reason
+
+
+@pytest.mark.parametrize(
+    "secret_message, leaked",
+    [
+        # Explicit credential label with a short value (Basic auth / api_key).
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ("api_key=abcd1234 short", "abcd1234"),
+        # Opaque token tail that a truncate-first implementation would emit as
+        # a 27-character prefix.
+        ("Refused: " + "x " * 92 + "a" * 32, "a" * 27),
+    ],
+)
+def test_credential_shaped_broker_message_never_reaches_status(secret_message, leaked):
+    def reject():
+        raise error_from_rpc(
+            {
+                "code": -32010,
+                "message": secret_message,
+                "data": {"missingFields": ["adapterOwnedLaunchReceipt"]},
+            }
+        )
+
+    status = probe_aftereffects(
+        client=SimpleNamespace(capabilities=lambda: capability_payload()),
+        app_factory=lambda **_kw: SimpleNamespace(version="25.6x101", runtime_identity=reject),
+    )
+
+    assert status.ready is False
+    assert leaked not in status.reason
+    assert leaked not in status.rejection["message"]
+    assert status.rejection["message"] == CURATED_32010
     assert "-32010" in status.reason
     assert "adapterOwnedLaunchReceipt" in status.reason
     assert "fail-closed" in status.reason
