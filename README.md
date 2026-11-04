@@ -116,6 +116,13 @@ identity until CEP launch-receipt/bootstrap support exists, so readiness remains
 fail-closed. The dependency update does not claim live-host support.
 A broker process is stopped only when it was started by this adapter.
 
+When a connection or session is refused, the panel, `verify` output, and
+readiness logs show the broker's public-safe rejection reason (numeric `code`,
+`message`, and `data.missingFields` when present, e.g. `-32010` with
+`adapterOwnedLaunchReceipt`). This is observability only: displaying a rejection
+does **not** mean the adapter now has typed-identity or CEP launch-receipt
+connection capability, and readiness stays fail-closed.
+
 ## Skill groups
 
 - `aftereffects-project`: inspect/open/save projects, list and import project
