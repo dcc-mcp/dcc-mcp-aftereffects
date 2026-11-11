@@ -82,6 +82,32 @@ Default host and profile paths are:
 - macOS host: `/Applications/Adobe After Effects 2024/Adobe After Effects 2024.app`
 - macOS CEP root: `~/Library/Application Support/Adobe/CEP/extensions`
 
+### Explicit Windows host paths
+
+`--dcc-path` can select an existing `AfterFX.exe` in a custom location such as
+`C:\Studio\AppCache\AfterEffects\bin\AfterFX.exe`. With this explicit selection,
+the parent directories need not be named `Support Files` and
+`Adobe After Effects 20xx`. Automatic discovery still searches and validates
+the standard Adobe layout; macOS application-bundle rules are unchanged.
+
+The file must remain a physical native executable named `AfterFX.exe`, with no
+link/reparse boundary, a valid Adobe signature, matching After Effects product
+and original-filename metadata, and version 24.0+. The version comes from
+verified product metadata rather than the folder name. A supplied path is a
+selection, not a new trust root; there is no unsigned or skip-signature mode.
+
+The preflight binds exact host and trusted OS signature-helper bytes and
+physical identities, then immediately rechecks them. Verification still binds
+the selected executable, PID/start identity, broker and receipted CEP module.
+File replacement, redirection or a foreign process fails closed. Existing
+receipt fields and schema are unchanged. Signature validation is product and
+integrity evidence, not an Adobe activation or licensing check.
+
+On Windows, the signature query uses the verified system PowerShell helper and
+its own system-module directory in the child process. This avoids inherited
+PowerShell Core module paths and shadow modules. Parent/system environment,
+execution policy and signature requirements are not changed.
+
 The adapter owns only the `dcc-mcp-aftereffects` child under that CEP root and
 its receipt. Unsupported hosts, interpreters, and profiles fail preflight
 before any directory is changed.
@@ -156,6 +182,25 @@ A commit or verification failure restores the exact prior directory and receipt.
 No delete-then-copy update is used.
 
 ## Verify
+
+### Find the bridge panel
+
+After Effects exposes CEP panels through **Window > Extensions**. Look for
+**adobepy Bridge** with this adapter's pinned adobepy 0.12.0 template. A newer
+template may label it **DCC-MCP / AdobePy Bridge**; inspect the installed
+`CSXS/manifest.xml` instead of assuming a version from its label. This is an
+extension entry, not a custom top-level DCC-MCP menu.
+
+For a missing entry, distinguish an unloaded/uninstalled extension, unsupported
+host version, cached older payload or duplicate bundle ID, and a reported
+load/signing error. A directory on disk or UI tool's `input_failed` alone does
+not establish which state applies. Preserve the actual report. Do not enable
+unsigned loading, alter receipted files or create another copy as a shortcut.
+The approved lifecycle must restage and receipt any new payload; SDK source UI
+work does not change this adapter's audited SDK/CLI pin.
+
+Panel visibility is separate from typed identity/connection verification below.
+See Adobe's [CEP panel menu contract](https://github.com/Adobe-CEP/CEP-Resources/blob/master/UXP-Migration-Guide/README.md#plugin-types).
 
 ```text
 dcc-mcp-aftereffects verify --dcc-path "<absolute After Effects path>" --python "<adapter python>" --json
