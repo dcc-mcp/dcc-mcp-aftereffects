@@ -82,6 +82,12 @@ dcc-mcp-aftereffects install --json --yes --dcc-path "<host>" --python "<python>
 dcc-mcp-aftereffects verify --json --dcc-path "<host>" --python "<python>"
 ```
 
+On Windows, `--dcc-path` may select a relocated `AfterFX.exe` outside the default
+Adobe folder layout. It still requires a valid Adobe signature, After Effects
+product metadata and the supported version; exact file and process identity
+checks remain in place. Automatic discovery keeps the standard Adobe paths.
+See [explicit Windows paths](install.md#explicit-windows-host-paths).
+
 For an Internal deployment with an approved prebuilt CEP bridge, the shared
 CLI can link the bridge directly into the Adobe CEP extension root:
 
@@ -115,6 +121,14 @@ trusted runtime identity is available. adobepy 0.12.0 still rejects After Effect
 identity until CEP launch-receipt/bootstrap support exists, so readiness remains
 fail-closed. The dependency update does not claim live-host support.
 A broker process is stopped only when it was started by this adapter.
+
+Find the CEP panel under **Window > Extensions**. The pinned adobepy 0.12.0
+template calls it **adobepy Bridge**; newer templates may use
+**DCC-MCP / AdobePy Bridge**. The installed manifest determines the label.
+A source change does not update this adapter's audited CLI pin or an existing
+extension. Opening the panel does not establish readiness. See
+[finding the panel](install.md#find-the-bridge-panel) before treating a missing
+entry as a missing product feature.
 
 ## Skill groups
 

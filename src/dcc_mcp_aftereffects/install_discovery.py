@@ -376,6 +376,7 @@ def _verified_host_evidence(
         # instead of degrading to `?`.
         script = (
             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+            "$env:PSModulePath=[System.IO.Path]::Combine($PSHOME,'Modules');"
             "$self=Get-AuthenticodeSignature -LiteralPath $PSHOME\\powershell.exe;"
             "$selfv=(Get-Item -LiteralPath $PSHOME\\powershell.exe).VersionInfo;"
             "$p=[System.Text.Encoding]::UTF8.GetString("
@@ -391,9 +392,16 @@ def _verified_host_evidence(
             "product=[string]$v.ProductName;original=[string]$v.OriginalFilename;"
             "version=[string]$v.ProductVersion}|ConvertTo-Json -Compress"
         )
+        # A pwsh parent can leak Core modules into Windows PowerShell 5.1.
+        # Resolve only this verified helper's system modules in the child.
+        environment = {
+            key: value for key, value in os.environ.items() if key.casefold() != "psmodulepath"
+        }
+        environment["PSModulePath"] = str(helper.parent / "Modules")
         try:
             result = subprocess.run(
                 [str(helper), "-NoProfile", "-NonInteractive", "-Command", script],
+                env=environment,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -693,12 +701,19 @@ def _resolve_host(
         canonical = bool(
             resolved_host.is_file()
             and resolved_host.name.casefold() == "afterfx.exe"
-            and resolved_host.parent.name.casefold() == "support files"
             and native_host
-            and re.fullmatch(
-                r"Adobe After Effects 20\d{2}",
-                resolved_host.parent.parent.name,
-                flags=re.IGNORECASE,
+            # Explicit selection is authenticated by signed product evidence
+            # below; folder names constrain automatic discovery only.
+            and (
+                bool(request.dcc_path)
+                or (
+                    resolved_host.parent.name.casefold() == "support files"
+                    and re.fullmatch(
+                        r"Adobe After Effects 20\d{2}",
+                        resolved_host.parent.parent.name,
+                        flags=re.IGNORECASE,
+                    )
+                )
             )
         )
     elif platform == "darwin":
@@ -730,7 +745,9 @@ def _resolve_host(
     if not canonical:
         raise PreflightError(
             "host",
-            "--dcc-path must select a canonical After Effects AfterFX.exe or application bundle",
+            "--dcc-path must select a native After Effects executable named AfterFX.exe"
+            if request.dcc_path and platform == "win32"
+            else "--dcc-path must select a canonical After Effects AfterFX.exe or application bundle",
         )
     host_identity = trusted_host_attestation(resolved_host, platform, environ=environ)
     if not host_identity:
