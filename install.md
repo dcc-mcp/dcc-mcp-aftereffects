@@ -221,5 +221,12 @@ extensions, the broker, and adobepy remain operator-owned.
 | Exit 40, `readiness` | CEP bridge is not loaded or typed RPC failed | Start the intended project, follow Adobe's CEP development workflow if required, and rerun verify. |
 | Exit 50 | host reload or real file lock | Save work, close/restart only the reported After Effects instance, then repeat. |
 
+On a refused connection or session, `verify` and the Bridge panel show the
+broker's public-safe rejection reason (numeric `code`, `message`, and
+`data.missingFields` when present, e.g. `-32010` with
+`adapterOwnedLaunchReceipt`). Showing that reason is observability only: it does
+**not** mean the adapter has typed-identity or CEP launch-receipt connection
+capability, and readiness remains fail-closed.
+
 For shared runtime diagnosis, keep the redacted failure report and run
 `dcc-mcp-cli doctor` and `dcc-mcp-cli list`.
