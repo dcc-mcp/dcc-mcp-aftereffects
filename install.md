@@ -67,7 +67,7 @@ bridges, trust checks, receipts, upgrades, and uninstall.
 
 ## Supported versions
 
-Current adapter release: **0.8.0** <!-- x-release-please-version -->
+Current adapter release: **0.9.0** <!-- x-release-please-version -->
 
 | Adapter | dcc-mcp-core | After Effects | Python | Platform |
 |---|---|---|---|---|

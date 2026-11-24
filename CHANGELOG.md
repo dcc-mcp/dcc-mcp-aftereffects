@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.8.0...v0.9.0) (2026-11-24)
+
+
+### Features
+
+* **ux:** surface broker connection rejection reason on readiness failures ([852b9a7](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/852b9a74bdecfee348dd1521da9cad4ede916a2b))
+* **ux:** surface broker connection rejection reason on readiness failures ([fec27e9](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/fec27e9913100cacc4afc8257996a7848f3fd32f))
+
+
+### Bug Fixes
+
+* support verified After Effects executable locations ([#36](https://github.com/dcc-mcp/dcc-mcp-aftereffects/issues/36)) ([548db46](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/548db46e133d8ac0cd90ed749b5eb2d1767b3592))
+* **ux:** replace blacklist with strict allowlist for broker rejection text ([56242b9](https://github.com/dcc-mcp/dcc-mcp-aftereffects/commit/56242b97d024044bca8a8595877c478915f4a858))
+
 ## [0.8.0](https://github.com/dcc-mcp/dcc-mcp-aftereffects/compare/v0.7.3...v0.8.0) (2026-10-28)
 
 
