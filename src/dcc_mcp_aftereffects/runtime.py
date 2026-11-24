@@ -10,6 +10,8 @@ from adobe.core import BrokerClient
 from adobe.core.errors import IdentityUnavailableError
 from adobe.core.runtime_identity import RuntimeIdentityAttestation
 
+from .bridge_rejection import BrokerRejection, extract_rejection
+
 REQUIRED_METHODS: Mapping[str, tuple[str, ...]] = {
     "app": ("getVersion", "openProject"),
     "project": (
@@ -82,6 +84,32 @@ class AfterEffectsStatus:
     target: str = "default"
     identity: Mapping[str, Any] | None = None
     error_type: str | None = None
+    # Public-safe, structured broker rejection (code/message/missingFields),
+    # or None when the failure carries no structured broker error.
+    rejection: Mapping[str, Any] | None = None
+
+
+def _reason_with_rejection(base: str, rejection: BrokerRejection | None) -> str:
+    """Append a bounded, public-safe broker rejection to a failure reason."""
+    if rejection is None:
+        return base
+    return f"{base}; {rejection.render()}"
+
+
+def _not_ready(
+    reason: str,
+    *,
+    target: str,
+    error_type: str | None,
+    rejection: BrokerRejection | None,
+) -> AfterEffectsStatus:
+    return AfterEffectsStatus(
+        False,
+        _reason_with_rejection(reason, rejection),
+        target=target,
+        error_type=error_type,
+        rejection=rejection.as_public_dict() if rejection is not None else None,
+    )
 
 
 def _matching_session(payloads: list[Mapping[str, Any]], target: str) -> Mapping[str, Any] | None:
@@ -158,13 +186,27 @@ def probe_aftereffects(
         timeout=timeout,
     )
     try:
-        session = _matching_session(active_client.capabilities(), target)
-    except Exception:  # noqa: BLE001 - readiness must remain queryable
-        return AfterEffectsStatus(
-            False,
+        capabilities_response = active_client.capabilities()
+        if isinstance(capabilities_response, Mapping):
+            # A broker can answer the capabilities GET with a JSON-RPC error
+            # envelope instead of a session list; surface that rejection too.
+            rejection = extract_rejection(capabilities_response, token=token)
+            if rejection is not None:
+                return _not_ready(
+                    "adobepy broker capability probe failed",
+                    target=target,
+                    error_type="broker_probe_failed",
+                    rejection=rejection,
+                )
+            session = None
+        else:
+            session = _matching_session(capabilities_response, target)
+    except Exception as exc:  # noqa: BLE001 - readiness must remain queryable
+        return _not_ready(
             "adobepy broker capability probe failed",
             target=target,
             error_type="broker_probe_failed",
+            rejection=extract_rejection(exc, token=token),
         )
     if session is None:
         return AfterEffectsStatus(
@@ -189,19 +231,19 @@ def probe_aftereffects(
         version = str(app.version)
         runtime_identity = getattr(app, "runtime_identity", None)
         identity = runtime_identity() if callable(runtime_identity) else runtime_identity
-    except IdentityUnavailableError:
-        return AfterEffectsStatus(
-            False,
+    except IdentityUnavailableError as exc:
+        return _not_ready(
             "adobepy has no trusted After Effects CEP runtime identity",
             target=target,
             error_type="runtime_identity_unavailable",
+            rejection=extract_rejection(exc, token=token),
         )
-    except Exception:  # noqa: BLE001 - readiness reports stable host failures
-        return AfterEffectsStatus(
-            False,
+    except Exception as exc:  # noqa: BLE001 - readiness reports stable host failures
+        return _not_ready(
             "typed After Effects runtime probe failed",
             target=target,
             error_type="host_rpc_failed",
+            rejection=extract_rejection(exc, token=token),
         )
     identity = _normalize_runtime_identity(identity)
     if identity is None:
