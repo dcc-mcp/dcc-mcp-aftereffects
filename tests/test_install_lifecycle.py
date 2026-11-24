@@ -8,6 +8,8 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from dcc_mcp_aftereffects.install_contract import (
     EXIT_INSTALL,
     EXIT_OK,
@@ -101,7 +103,9 @@ def _python_module_identities(tmp_path: Path) -> dict[str, object]:
     return capture_python_modules(raw)
 
 
-def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> ResolvedInstall:
+def resolved_install(
+    tmp_path: Path, secret: str = "bridge-token-secret", *, host_path: Path | None = None
+) -> ResolvedInstall:
     def physical(path: Path) -> dict[str, int]:
         details = path.lstat()
         return {
@@ -113,7 +117,7 @@ def resolved_install(tmp_path: Path, secret: str = "bridge-token-secret") -> Res
             "changed_ns": int(details.st_ctime_ns),
         }
 
-    host = tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
+    host = host_path or tmp_path / "Adobe After Effects 2024" / "Support Files" / "AfterFX.exe"
     host.parent.mkdir(parents=True)
     host.write_bytes(b"host")
     signature_helper = (
@@ -309,9 +313,11 @@ def test_install_dry_run_is_a_non_mutating_schema_v1_plan(tmp_path):
     assert not resolved.receipt_path.exists()
 
 
-def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path):
+@pytest.mark.parametrize("custom_location", [False, True])
+def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path, custom_location):
     secret = "never-put-this-token-in-argv"
-    resolved = resolved_install(tmp_path, secret)
+    host_path = tmp_path / "vendor-cache" / "bin" / "AfterFX.exe" if custom_location else None
+    resolved = resolved_install(tmp_path, secret, host_path=host_path)
     runner = BridgeRunner()
     dependencies = healthy_dependencies(runner)
 
@@ -321,6 +327,8 @@ def test_install_round_trip_uses_env_token_and_reaches_typed_readiness(tmp_path)
         dependencies=dependencies,
     )
     receipt = json.loads(resolved.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["host_path"] == str(resolved.host_path)
+    assert receipt["host_identity"] == resolved.host_identity
     status_report, status_exit = run_lifecycle(
         InstallRequest("status", as_json=True),
         resolved=resolved,

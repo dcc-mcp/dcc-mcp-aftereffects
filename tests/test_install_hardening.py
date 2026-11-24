@@ -635,7 +635,7 @@ def test_host_override_rejects_non_afterfx_executable(tmp_path: Path) -> None:
     imposter.parent.mkdir(parents=True)
     imposter.write_bytes(b"not After Effects")
 
-    with pytest.raises(PreflightError, match="canonical After Effects"):
+    with pytest.raises(PreflightError, match="native After Effects executable named AfterFX.exe"):
         _resolve_host(InstallRequest("status", dcc_path=str(imposter)), "win32", {})
 
 
@@ -646,12 +646,109 @@ def test_host_override_rejects_unsigned_afterfx_spoof(
     spoof.parent.mkdir(parents=True)
     spoof.write_bytes(b"MZunsigned-spoof")
     monkeypatch.setattr(
-        "dcc_mcp_aftereffects.install_discovery._trusted_host_version",
-        lambda _path, _platform: None,
+        install_discovery,
+        "trusted_host_attestation",
+        lambda *_args, **_kwargs: None,
     )
 
     with pytest.raises(PreflightError, match="metadata or platform signature"):
         _resolve_host(InstallRequest("status", dcc_path=str(spoof)), "win32", {})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "failure_stage"),
+    [
+        ({}, None),
+        ({"status": "HashMismatch"}, "host"),
+        ({"status": "NotSigned"}, "host"),
+        ({"subject": "CN=Example Corp"}, "host"),
+        ({"product": "Another Adobe Product"}, "host"),
+        ({"original": "renderer.exe"}, "host"),
+        ({"version": "23.6"}, "host_version"),
+    ],
+)
+def test_explicit_custom_host_keeps_product_signature_version_and_byte_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, str],
+    failure_stage: str | None,
+) -> None:
+    host = tmp_path / "Studio 缓存" / "2024.24.6.3-thm.2" / "bin" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZrelocated-after-effects")
+    system_root = tmp_path / "Windows"
+    helper = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"trusted-system-helper")
+    commands: list[list[str]] = []
+    signature_runner = _recording_windows_signature_runner(commands)
+
+    def run(command, **kwargs):
+        completed = signature_runner(command, **kwargs)
+        evidence = json.loads(completed.stdout)
+        evidence.update(overrides)
+        return subprocess.CompletedProcess(command, 0, json.dumps(evidence), "")
+
+    monkeypatch.setattr(install_discovery.subprocess, "run", run)
+    monkeypatch.setattr(install_discovery, "_windows_directory", lambda: system_root)
+    monkeypatch.setattr(install_discovery, "_win_verify_trust", lambda _path: True)
+    request = InstallRequest("status", dcc_path=str(host))
+    if failure_stage is not None:
+        with pytest.raises(PreflightError) as failed:
+            _resolve_host(request, "win32", {})
+        assert failed.value.stage == failure_stage
+        assert "canonical" not in str(failed.value)
+    else:
+        selected, version, identity = _resolve_host(request, "win32", {})
+        assert selected == host.resolve()
+        assert version == "25.0.0"  # Signed metadata, not the directory label.
+        assert identity["host"]["path"] == str(host.resolve())
+        assert reattest_host(selected, identity) is True
+        host.write_bytes(b"MZchanged-after-preflight")
+        assert reattest_host(selected, identity) is False
+    assert commands  # A directory-name failure must not mask signature coverage.
+    assert all(command[0] == str(helper) for command in commands)
+
+
+def test_automatic_discovery_does_not_accept_custom_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "Adobe After Effects 2024" / "bin" / "AfterFX.exe"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"MZnative-host")
+    monkeypatch.setattr(install_discovery, "_host_candidates", lambda *_args: [host])
+
+    def unexpected_attestation(*_args, **_kwargs):
+        pytest.fail("automatic discovery must retain its canonical layout gate")
+
+    monkeypatch.setattr(install_discovery, "trusted_host_attestation", unexpected_attestation)
+    with pytest.raises(PreflightError, match="canonical After Effects"):
+        _resolve_host(InstallRequest("status"), "win32", {})
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents"),
+    [("renderer.exe", b"MZnative-host"), ("AfterFX.exe", b"not-native"), ("AfterFX.exe", None)],
+)
+def test_explicit_custom_path_rejects_invalid_native_target_before_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    contents: bytes | None,
+) -> None:
+    host = tmp_path / "cache" / "bin" / filename
+    host.parent.mkdir(parents=True)
+    if contents is None:
+        host.mkdir()
+    else:
+        host.write_bytes(contents)
+
+    def unexpected_attestation(*_args, **_kwargs):
+        pytest.fail("an invalid executable must be rejected before signature probing")
+
+    monkeypatch.setattr(install_discovery, "trusted_host_attestation", unexpected_attestation)
+    with pytest.raises(PreflightError):
+        _resolve_host(InstallRequest("status", dcc_path=str(host)), "win32", {})
 
 
 def test_powershell_base64_literal_is_pure_ascii_and_round_trips() -> None:
@@ -685,6 +782,10 @@ def test_windows_probe_base64_encodes_host_path_and_forces_utf8_output(
     host.parent.mkdir(parents=True)
     host.write_bytes(b"MZtrusted-afterfx")
     captured: dict = {}
+    inherited_modules = str(tmp_path / "untrusted-core-modules")
+    monkeypatch.setenv("PSModulePath", inherited_modules)
+    monkeypatch.setenv("pSmOdUlEpAtH", str(tmp_path / "shadow-modules"))
+    parent_environment = dict(os.environ)
 
     def run(command, **kwargs):
         captured["command"] = [str(item) for item in command]
@@ -726,6 +827,18 @@ def test_windows_probe_base64_encodes_host_path_and_forces_utf8_output(
     assert base64.b64decode(literal[1:-1]).decode("utf-8") == str(host)
     assert "OutputEncoding" in script
     assert captured["kwargs"].get("encoding") == "utf-8"
+    module_reset = "$env:PSModulePath=[System.IO.Path]::Combine($PSHOME,'Modules');"
+    assert module_reset in script
+    assert script.index(module_reset) < script.index("Get-AuthenticodeSignature")
+    child_environment = captured["kwargs"]["env"]
+    module_paths = [
+        value for key, value in child_environment.items() if key.casefold() == "psmodulepath"
+    ]
+    assert module_paths == [str(helper.parent / "Modules")]
+    assert inherited_modules not in module_paths
+    assert child_environment.get("PATH") == parent_environment.get("PATH")
+    assert dict(os.environ) == parent_environment
+    assert "ExecutionPolicy" not in command
 
 
 def test_windows_probe_never_executes_smart_quote_injection(
@@ -1164,11 +1277,14 @@ def test_install_recaptures_the_exact_host_before_any_staging_or_installer_proce
         "metadata-drift",
     ],
 )
+@pytest.mark.parametrize("custom_location", [False, True])
 def test_verify_requires_exact_host_recapture_before_import_or_runtime_processes(
     tmp_path: Path,
     mode: str,
+    custom_location: bool,
 ) -> None:
-    base = resolved_install(tmp_path)
+    host_path = tmp_path / "vendor-cache" / "bin" / "AfterFX.exe" if custom_location else None
+    base = resolved_install(tmp_path, host_path=host_path)
     expected = _test_host_attestation(base.host_path, base.host_version)
     resolved = replace(base, host_identity=expected)
     runner = BridgeRunner()
@@ -2071,10 +2187,12 @@ def test_ready_probe_without_exact_runtime_identity_fails_closed(tmp_path: Path)
     ],
     ids=["missing", "empty", "unavailable", "foreign-executable"],
 )
+@pytest.mark.parametrize("custom_location", [False, True])
 def test_invalid_process_attestation_rolls_back_the_fresh_install(
-    tmp_path: Path, process_identity: object
+    tmp_path: Path, process_identity: object, custom_location: bool
 ) -> None:
-    resolved = resolved_install(tmp_path)
+    host_path = tmp_path / "vendor-cache" / "bin" / "AfterFX.exe" if custom_location else None
+    resolved = resolved_install(tmp_path, host_path=host_path)
     runner = BridgeRunner()
     dependencies = healthy_dependencies(runner)
     dependencies.process_probe = lambda _pid: process_identity  # type: ignore[assignment]

@@ -29,7 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--dcc-path")
+    parser.add_argument(
+        "--dcc-path",
+        help="Exact AfterFX.exe or macOS app; custom Windows locations still require verified Adobe identity",
+    )
     parser.add_argument("--python")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
